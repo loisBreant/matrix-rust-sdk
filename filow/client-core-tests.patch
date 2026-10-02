@@ -1,0 +1,172 @@
+diff --git a/client_core/src/matrix/live_synapse_redactions.rs b/client_core/src/matrix/live_synapse_redactions.rs
+index ee5f6fbd..4105e732 100644
+--- a/client_core/src/matrix/live_synapse_redactions.rs
++++ b/client_core/src/matrix/live_synapse_redactions.rs
+@@ -1,5 +1,5 @@
+-//! Edits and redactions against a real Synapse, in a real Megolm-encrypted
+-//! room (issue #92). Opt-in, like the key-backup suite next door:
++//! Edits, redactions and reactions against a real Synapse, in a real
++//! Megolm-encrypted room (issues #92 and #106). Opt-in, like the key-backup suite next door:
+ //! `scripts/live-matrix-key-backup.sh` starts the pinned Synapse image and
+ //! registers the user, then runs every `live_synapse` test (feature
+ //! `live-matrix-tests`).
+@@ -8,7 +8,8 @@
+ //! redaction in /sync, the redacted copy it serves from /messages for an
+ //! encrypted event deleted earlier, and an edit's relation surviving Megolm
+ //! decryption — the wiremock fixtures in sync.rs and backfill.rs are modelled
+-//! on these.
++//! on these — and a reaction from one device reaching another as a trusted,
++//! encrypted event.
+ 
+ use matrix_sdk::{
+     Client,
+@@ -37,6 +38,13 @@ fn var(name: &str) -> String {
+         .unwrap_or_else(|_| panic!("{name} is not set: run scripts/live-matrix-key-backup.sh"))
+ }
+ 
++/// The Matrix device ID Filow Node would give the device `name`: `FILOW_`
++/// and 32 upper-case hex digits, so it can go into an own-device allowlist.
++fn device_id(name: &str) -> String {
++    let hex: String = name.bytes().map(|byte| format!("{byte:02X}")).collect();
++    format!("FILOW_{hex:0<32}")
++}
++
+ /// A device of the edits user, logged in and synced once. Its own user,
+ /// not the key-backup suite's: the two suites run side by side, and that
+ /// one replaces its user's cross-signing identity.
+@@ -51,7 +59,7 @@ async fn device(name: &str) -> (Client, tempfile::TempDir) {
+             var("FILOW_LIVE_SYNAPSE_EDITS_USER"),
+             &var("FILOW_LIVE_SYNAPSE_PASSWORD"),
+         )
+-        .device_id(&format!("FILOW_LIVE_EDITS_{name}"))
++        .device_id(&device_id(name))
+         .initial_device_display_name(name)
+         .send()
+         .await
+@@ -145,9 +153,6 @@ async fn live_synapse_edits_and_redactions_reach_the_local_store() {
+ 
+     // 1. Everything arrives and is stored as it is now: a message that is
+     //    then edited, one that is then deleted, one left as it is.
+-    //    (Reactions are not part of this run: matrix-sdk sends them in
+-    //    clear, and the client drops clear reactions in an encrypted room —
+-    //    the unit tests cover a removed reaction.)
+     let edited = room
+         .send(RoomMessageEventContent::text_plain("live first draft"))
+         .await
+@@ -175,7 +180,21 @@ async fn live_synapse_edits_and_redactions_reach_the_local_store() {
+     }
+ 
+     // 2. Then the sender edits and deletes for everyone — and one more
+-    //    message is deleted before this device sees it.
++    //    message is deleted before this device sees it. The sender also
++    //    reacts, as Filow does.
++    let allowlist = OwnDeviceAllowlist::default();
++    allowlist
++        .set(vec![device_id("READER")])
++        .expect("valid allowlist");
++    let reaction = super::send_reaction(
++        &sender,
++        &allowlist,
++        room_id.as_str(),
++        edited.as_str(),
++        "👍",
++    )
++    .await
++    .expect("react");
+     room.send(
+         RoomMessageEventContent::text_plain("live final text")
+             .make_replacement(ReplacementMetadata::new(edited.clone(), None)),
+@@ -204,6 +223,15 @@ async fn live_synapse_edits_and_redactions_reach_the_local_store() {
+             "decrypted and edited: {stored:?}"
+         );
+         assert!(edit.edited);
++        // The other device keeps the reaction: it arrived encrypted, from a
++        // device the account signed (issue #106).
++        let reactions = store
++            .reactions_for_event(room_id.as_str(), edited.as_str())
++            .expect("read reactions");
++        assert_eq!(reactions.len(), 1, "{reactions:?}");
++        assert_eq!(reactions[0].event_id, reaction);
++        assert_eq!(reactions[0].key, "👍");
++        assert_eq!(reactions[0].sender_id, sender.user_id().expect("user").as_str());
+         let gone = find(&stored, &deleted);
+         assert!(gone.redacted, "{stored:?}");
+         assert_eq!(gone.body, "");
+@@ -239,6 +267,14 @@ async fn live_synapse_edits_and_redactions_reach_the_local_store() {
+             .expect("read");
+         assert!(find(&stored, &deleted).redacted);
+         assert_eq!(find(&stored, &edited).body, "live final text");
++        assert_eq!(
++            store
++                .reactions_for_event(room_id.as_str(), edited.as_str())
++                .expect("read reactions")
++                .len(),
++            1,
++            "the reaction survives paginating the history again"
++        );
+         assert_nowhere(&store, room_id.as_str(), "live deleted");
+     }
+ 
+diff --git a/client_core/src/matrix/send.rs b/client_core/src/matrix/send.rs
+index b839c454..4c6b1d80 100644
+--- a/client_core/src/matrix/send.rs
++++ b/client_core/src/matrix/send.rs
+@@ -574,6 +574,58 @@ mod tests {
+         assert_eq!(traffic.sessions.len(), 1);
+     }
+ 
++    // Issue #106: a reaction leaves the device Megolm-encrypted like any
++    // other event. The account's other devices drop a clear reaction in an
++    // encrypted room (the homeserver could have forged it), so one sent in
++    // clear is lost everywhere but in the sender's local echo. Its relation
++    // stays in the clear envelope as well, as the spec requires, for the
++    // server to aggregate it.
++    #[tokio::test]
++    async fn a_reaction_in_an_encrypted_room_is_encrypted() {
++        let server = homeserver().await;
++        let (client, _store) = logged_in_client(&server).await;
++        encrypted_room(
++            &server,
++            &client,
++            &[
++                owner(vec![(ALLOWED_DEVICE, Signed::Yes)]),
++                Member::cross_signed(BOT, vec![(BOT_DEVICE, Signed::Yes)]),
++            ],
++            true,
++        )
++        .await;
++        let allowlist = OwnDeviceAllowlist::default();
++        allowlist
++            .set(vec![ALLOWED_DEVICE.to_owned()])
++            .expect("valid allowlist");
++
++        send_reaction(&client, &allowlist, ROOM, "$target", "👍")
++            .await
++            .expect("send");
++
++        let requests = server.received_requests().await.expect("recorded requests");
++        let sent: Vec<_> = requests
++            .iter()
++            .filter(|request| request.url.path().contains(&format!("/rooms/{ROOM}/send/")))
++            .collect();
++        assert_eq!(sent.len(), 1, "one event sent");
++        assert!(
++            sent[0].url.path().contains("/send/m.room.encrypted/"),
++            "sent as {}",
++            sent[0].url.path()
++        );
++        let envelope: serde_json::Value =
++            serde_json::from_slice(&sent[0].body).expect("JSON body");
++        assert_eq!(envelope["algorithm"], "m.megolm.v1.aes-sha2");
++        assert_eq!(
++            envelope["m.relates_to"],
++            json!({ "rel_type": "m.annotation", "event_id": "$target", "key": "👍" })
++        );
++        let traffic = sent_traffic(&requests);
++        assert!(traffic.keyed(BOT, BOT_DEVICE), "the bridge bot got the key");
++        assert!(traffic.keyed(OWN_USER, ALLOWED_DEVICE));
++    }
++
+     // MSC4153, from the adversary's side: a device nobody cross-signed gets
+     // no room key, whoever it claims to belong to — a second device of the
+     // bridge bot (a malicious homeserver can add one), a ghost's device (a
