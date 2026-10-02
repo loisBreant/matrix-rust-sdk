@@ -204,27 +204,27 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
             #[cfg(feature = "e2e-encryption")]
             if room.latest_encryption_state().await?.is_encrypted() {
                 Span::current().record("is_room_encrypted", true);
-                // Reactions are currently famously not encrypted, skip encrypting
-                // them until they are.
-                if event_type == "m.reaction" {
-                    trace!("Sending plaintext event because of the event type.");
-                } else {
-                    trace!(
-                        room_id = ?room.room_id(),
-                        "Sending encrypted event because the room is encrypted.",
-                    );
+                // Every event is encrypted in an encrypted room, reactions
+                // included (Filow patch): a reaction sent in the clear carries
+                // no proof of which device sent it, so a client that only
+                // trusts events from verified devices has to drop it. The
+                // relation still goes in the clear envelope as well, as the
+                // spec requires for server-side aggregation.
+                trace!(
+                    room_id = ?room.room_id(),
+                    "Sending encrypted event because the room is encrypted.",
+                );
 
-                    ensure_room_encryption_ready(room).await?;
+                ensure_room_encryption_ready(room).await?;
 
-                    let olm = room.client.olm_machine().await;
-                    let olm = olm.as_ref().expect("Olm machine wasn't started");
+                let olm = room.client.olm_machine().await;
+                let olm = olm.as_ref().expect("Olm machine wasn't started");
 
-                    let result =
-                        olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?;
-                    content = result.content.cast();
-                    encryption_info = Some(result.encryption_info);
-                    event_type = "m.room.encrypted";
-                }
+                let result =
+                    olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?;
+                content = result.content.cast();
+                encryption_info = Some(result.encryption_info);
+                event_type = "m.room.encrypted";
             } else {
                 Span::current().record("is_room_encrypted", false);
                 trace!("Sending plaintext event because the room is NOT encrypted.");
