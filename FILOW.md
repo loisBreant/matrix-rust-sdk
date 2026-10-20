@@ -1,11 +1,13 @@
 # Filow patches on matrix-rust-sdk
 
 This branch is `matrix-sdk-0.19.1` (upstream tag, commit `b18166c68`) plus
-the patches Filow needs and upstream does not ship. It is **not maintained**
-and not used by Filow yet: Filow builds against the released crates. Integrate
-it when it's needed (see "Integrating it into Filow").
+the patches Filow needs and upstream does not ship. Filow pins a commit of it
+in the `[patch.crates-io]` tables of `client_core/Cargo.toml` and
+`app/src-tauri/Cargo.toml` (Filow ADR 0025); each new patch is a new commit
+here and a new pin there.
 
-Tracking issue: https://github.com/loisBreant/Filow/issues/106
+Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
+https://github.com/loisBreant/Filow/issues/537 (patch 2)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -49,6 +51,32 @@ reaction or change its key.
   `verification_levels`, then dispatches it, and the portal calls
   `handleMatrixReaction`. They send their own reactions encrypted only with
   `encryption.msc4392: true`.
+
+## Patch 2: rotate the fallback key on request
+
+`crates/matrix-sdk-crypto/src/olm/account.rs`, `machine/mod.rs` and
+`crates/matrix-sdk/src/encryption/mod.rs`: `Account::rotate_fallback_key`,
+`OlmMachine::rotate_fallback_key` and `Encryption::rotate_fallback_key`
+generate and persist a new fallback key now, whatever the age of the current
+one; the next key upload (the next sync) publishes it. Nothing is done, and
+`false` is returned, while a fallback key still waits to be uploaded or
+before the account made its first one.
+
+### Why Filow needs it
+
+A managed Filow cell restored from a backup serves the fallback key Synapse
+held at the restore point. vodozemac keeps only the current and one previous
+fallback key, and `generate_fallback_key_if_needed` replaces the current one
+only once it is a week old, without asking which one the server holds. After
+a restore more than about two rotations back, a sender who finds no one-time
+key left claims a fallback key whose private half is gone, and its Olm
+message cannot be decrypted. Filow calls the rotation once per restore
+epoch, before the sync from scratch (Filow ADR 0044).
+
+Test: `test_fallback_key_rotation_on_request` in `olm/account.rs`. In Filow,
+`a_claim_after_a_restore_epoch_gets_a_fallback_key_the_device_holds`
+(`client_core/src/key_backup/integration_tests.rs`) is red without the
+rotation and green with it.
 
 ## Integrating it into Filow
 
