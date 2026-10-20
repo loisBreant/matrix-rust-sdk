@@ -1147,6 +1147,22 @@ impl Encryption {
         Ok(ret)
     }
 
+    /// Generate a new fallback key now, whatever the age of the current one;
+    /// the next sync uploads it.
+    ///
+    /// For a homeserver restored from a backup, which serves the fallback key
+    /// it held at the restore point: vodozemac keeps only the current and
+    /// one previous fallback key, so that one may be gone from this device.
+    ///
+    /// Returns whether a key was generated (see
+    /// [`OlmMachine::rotate_fallback_key`]).
+    pub async fn rotate_fallback_key(&self) -> Result<bool, CryptoStoreError> {
+        match self.client.olm_machine().await.as_ref() {
+            Some(machine) => machine.rotate_fallback_key().await,
+            None => Ok(false),
+        }
+    }
+
     /// Get all the tracked users we know about
     ///
     /// Tracked users are users for which we keep the device list of E2EE

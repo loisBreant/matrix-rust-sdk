@@ -2827,6 +2827,19 @@ impl OlmMachine {
             .await
     }
 
+    /// Generate and persist a new fallback key now, whatever the age of the
+    /// current one; the next [`OlmMachine::outgoing_requests`] uploads it.
+    ///
+    /// Returns whether a key was generated: nothing is done while a fallback
+    /// key is still waiting to be uploaded, or before the account created its
+    /// first one. See [`Account::rotate_fallback_key`].
+    pub async fn rotate_fallback_key(&self) -> StoreResult<bool> {
+        let mut transaction = self.inner.store.transaction().await;
+        let rotated = transaction.account().await?.rotate_fallback_key();
+        transaction.commit().await?;
+        Ok(rotated)
+    }
+
     async fn wait_if_user_pending(
         &self,
         user_id: &UserId,

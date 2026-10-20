@@ -643,6 +643,28 @@ impl Account {
         }
     }
 
+    /// Generate a new fallback key now, whatever the age of the current one.
+    ///
+    /// For a homeserver restored from a backup: it serves the fallback key it
+    /// held at the restore point, which may be one vodozemac has since
+    /// dropped (it keeps the current and one previous key), and
+    /// [`Account::generate_fallback_key_if_needed`] would not replace it
+    /// until the current one is a week old.
+    ///
+    /// Does nothing, and returns `false`, while a fallback key is waiting to
+    /// be published (rotating again would drop the previous key for no gain)
+    /// or if this account never created one (whether the server supports
+    /// fallback keys is not known yet; the next sync decides).
+    pub(crate) fn rotate_fallback_key(&mut self) -> bool {
+        if !self.inner.fallback_key().is_empty() || self.fallback_creation_timestamp.is_none() {
+            return false;
+        }
+        let removed_fallback_key = self.inner.generate_fallback_key();
+        self.fallback_creation_timestamp = Some(MilliSecondsSinceUnixEpoch::now());
+        debug!(?removed_fallback_key, "Rotated the fallback key on request.");
+        true
+    }
+
     /// Check if our most recent fallback key has expired.
     ///
     /// We consider the fallback key to be expired if it's older than a week.
@@ -2007,6 +2029,35 @@ mod tests {
             fourth_one_time_keys.keys().map(Deref::deref).collect();
 
         assert_ne!(one_time_key_ids, fourth_one_time_key_ids);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fallback_key_rotation_on_request() -> Result<()> {
+        let mut account = Account::with_device_id(user_id(), device_id());
+
+        // No fallback key yet: whether the server supports them is unknown.
+        assert!(!account.rotate_fallback_key());
+        assert!(account.keys_for_upload().2.is_empty());
+
+        let one_time_keys = BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, 50u8.into())]);
+        account.update_key_counts(&one_time_keys, Some([].as_ref()), false);
+        let first: Vec<_> = account.keys_for_upload().2.into_keys().collect();
+        assert!(!first.is_empty());
+
+        // Unpublished: nothing to rotate.
+        assert!(!account.rotate_fallback_key());
+        assert_eq!(account.keys_for_upload().2.into_keys().collect::<Vec<_>>(), first);
+        account.mark_keys_as_published();
+
+        // Published and fresh: the weekly rule would keep it, a request does not.
+        account.update_key_counts(&one_time_keys, Some([].as_ref()), false);
+        assert!(account.keys_for_upload().2.is_empty());
+        assert!(account.rotate_fallback_key());
+        let second: Vec<_> = account.keys_for_upload().2.into_keys().collect();
+        assert!(!second.is_empty());
+        assert_ne!(second, first);
+
         Ok(())
     }
 
