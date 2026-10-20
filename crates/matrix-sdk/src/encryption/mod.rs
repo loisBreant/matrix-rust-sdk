@@ -1147,20 +1147,40 @@ impl Encryption {
         Ok(ret)
     }
 
-    /// Generate a new fallback key now, whatever the age of the current one;
-    /// the next sync uploads it.
+    /// Generate a new fallback key now, whatever the age of the current one,
+    /// and upload it at once.
     ///
     /// For a homeserver restored from a backup, which serves the fallback key
     /// it held at the restore point: vodozemac keeps only the current and
     /// one previous fallback key, so that one may be gone from this device.
+    /// Rotating drops the previous key, so call this once the messages
+    /// queued for this device have been received: a sender may have claimed
+    /// the previous key for them.
     ///
     /// Returns whether a key was generated (see
-    /// [`OlmMachine::rotate_fallback_key`]).
-    pub async fn rotate_fallback_key(&self) -> Result<bool, CryptoStoreError> {
-        match self.client.olm_machine().await.as_ref() {
-            Some(machine) => machine.rotate_fallback_key().await,
-            None => Ok(false),
+    /// [`OlmMachine::rotate_fallback_key`]). An upload that fails is only
+    /// logged: the key stays unpublished, and the next sync uploads it.
+    pub async fn rotate_fallback_key(&self) -> Result<bool> {
+        use matrix_sdk_base::crypto::types::requests::AnyOutgoingRequest;
+
+        let olm = self.client.olm_machine().await;
+        let machine = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+        if !machine.rotate_fallback_key().await? {
+            return Ok(false);
         }
+        let uploads: Vec<_> = machine
+            .outgoing_requests()
+            .await?
+            .into_iter()
+            .filter(|request| matches!(request.request(), AnyOutgoingRequest::KeysUpload(_)))
+            .collect();
+        drop(olm);
+        for upload in uploads {
+            if let Err(error) = self.client.send_outgoing_request(upload).await {
+                warn!(?error, "Could not upload the rotated fallback key; the next sync will.");
+            }
+        }
+        Ok(true)
     }
 
     /// Get all the tracked users we know about

@@ -58,9 +58,10 @@ reaction or change its key.
 `crates/matrix-sdk/src/encryption/mod.rs`: `Account::rotate_fallback_key`,
 `OlmMachine::rotate_fallback_key` and `Encryption::rotate_fallback_key`
 generate and persist a new fallback key now, whatever the age of the current
-one; the next key upload (the next sync) publishes it. Nothing is done, and
-`false` is returned, while a fallback key still waits to be uploaded or
-before the account made its first one.
+one; `Encryption::rotate_fallback_key` also uploads it at once (a failed
+upload is logged and left to the next sync). Nothing is done, and `false` is
+returned, while a fallback key still waits to be uploaded or before the
+account made its first one.
 
 ### Why Filow needs it
 
@@ -71,7 +72,9 @@ only once it is a week old, without asking which one the server holds. After
 a restore more than about two rotations back, a sender who finds no one-time
 key left claims a fallback key whose private half is gone, and its Olm
 message cannot be decrypted. Filow calls the rotation once per restore
-epoch, before the sync from scratch (Filow ADR 0044).
+epoch, after a sync round that brought no to-device message: rotating drops
+the previous key, which a sender may have claimed for a message still
+queued for the device (Filow ADR 0044).
 
 Test: `test_fallback_key_rotation_on_request` in `olm/account.rs`. In Filow,
 `a_claim_after_a_restore_epoch_gets_a_fallback_key_the_device_holds`
