@@ -81,6 +81,19 @@ Test: `test_fallback_key_rotation_on_request` in `olm/account.rs`. In Filow,
 (`client_core/src/key_backup/integration_tests.rs`) is red without the
 rotation and green with it.
 
+## Dependency bump: rusqlite 0.42.0
+
+`crates/matrix-sdk-sqlite/Cargo.toml` asks for `rusqlite = "0.42.0"` instead
+of 0.40.2 (no code change). libsqlite3-sys declares `links = "sqlite3"`, so
+this crate and Filow's client core must use the same rusqlite major. Filow
+needs libsqlite3-sys 0.40 for RUSTSEC-2026-0459 (SQLite before 3.54.0 could
+return uninitialized page-cache memory for a database opened with a `-wal`
+file of another page size): its bundled SQLCipher 4.20.0 is built on SQLite
+3.54.1. rusqlite 0.41.x is not enough (with SQLCipher, libsqlite3-sys 0.39
+still builds SQLCipher 4.19.0 on SQLite 3.53.4). Upstream `main` moved to
+0.41.1 with no code change either (`18757f7e08`). Filow issue:
+https://github.com/loisBreant/Filow/issues/1205
+
 ## Integrating it into Filow
 
 1. Rebase this branch onto the matrix-sdk version Filow uses, if it has moved.
