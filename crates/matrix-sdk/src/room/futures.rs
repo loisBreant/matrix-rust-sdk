@@ -217,11 +217,45 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 
                 ensure_room_encryption_ready(room).await?;
 
-                let olm = room.client.olm_machine().await;
-                let olm = olm.as_ref().expect("Olm machine wasn't started");
-
-                let result =
-                    olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?;
+                let mut result = {
+                    let olm = room.client.olm_machine().await;
+                    let olm = olm.as_ref().expect("Olm machine wasn't started");
+                    olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?
+                };
+                // Filow patch 3: in a room whose keys go only to the own
+                // user's devices, an event leaves only under a session no one
+                // else holds. A share that was running when the room was
+                // marked, or that read the member list just before, can
+                // still have given the session to another member; it is
+                // checked after encrypting (a session shared later only
+                // carries later messages), then rotated once.
+                if room.client.base_client().room_keys_shared_only_with_own_user(room.room_id()) {
+                    for attempt in 0..2 {
+                        let guard = room.client.olm_machine().await;
+                        let olm = guard.as_ref().expect("Olm machine wasn't started");
+                        let session_id = encrypted_session_id(&result.content);
+                        if olm
+                            .room_key_shared_only_with_own_user(
+                                room.room_id(),
+                                session_id.as_deref(),
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        if attempt == 1 {
+                            return Err(crate::Error::RoomKeySharedBeyondOwnUser);
+                        }
+                        olm.discard_room_key(room.room_id()).await?;
+                        drop(guard);
+                        ensure_room_encryption_ready(room).await?;
+                        let olm = room.client.olm_machine().await;
+                        let olm = olm.as_ref().expect("Olm machine wasn't started");
+                        result = olm
+                            .encrypt_room_event_raw(room.room_id(), event_type, &content)
+                            .await?;
+                    }
+                }
                 content = result.content.cast();
                 encryption_info = Some(result.encryption_info);
                 event_type = "m.room.encrypted";
@@ -516,6 +550,12 @@ impl<'a> IntoFuture for SendStateEvent<'a> {
                 .await
         })
     }
+}
+
+/// The Megolm session an encrypted event was encrypted with.
+#[cfg(feature = "e2e-encryption")]
+fn encrypted_session_id<T>(content: &Raw<T>) -> Option<String> {
+    content.get_field::<String>("session_id").ok().flatten()
 }
 
 /// Ensures the room is ready for encrypted events to be sent.

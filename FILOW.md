@@ -94,9 +94,26 @@ the three readers of the member list on the send path use it:
 `BaseClient::share_room_key`, the one-time-key claim in
 `Room::preshare_room_key`, and `Room::query_keys_for_untracked_or_dirty_users`.
 The client's `CollectStrategy` still picks which of the own user's devices
-get the key; an outbound session already shared with someone else is rotated
-at the next share, as for a member who left. The mark is in memory, shared
-with `clone_with_in_memory_state_store` copies, and has no way back.
+get the key. The mark is in memory, shared with
+`clone_with_in_memory_state_store` copies, and has no way back.
+
+A key someone else holds never encrypts an event sent after the mark:
+
+- `Room::share_room_keys_only_with_own_user` (now `async`) discards the
+  room's outbound session when another user received it or has a request
+  pending to receive it (`OlmMachine::room_key_shared_only_with_own_user`).
+- `Room::send`/`send_raw` (`room/futures.rs`), in a marked room, check after
+  encrypting that the session used is still the room's, not invalidated, and
+  shared (sent or pending) with no other user; if not, the ciphertext is
+  dropped, the session discarded, the key shared again and the event
+  encrypted again, once; a second failure is `Error::RoomKeySharedBeyondOwnUser`
+  and nothing is sent. This closes the race the mark alone leaves: a share
+  that read the member list before the mark, or that the send joined through
+  `group_session_deduplicated_handler`, can still give the session to another
+  member. Checking after encrypting is sound because a session shared later
+  carries only its later messages.
+- Not covered: `send_state_event` encryption (`experimental-encrypted-state-events`,
+  which Filow does not enable).
 
 ### Why Filow needs it
 
@@ -112,8 +129,11 @@ outside; upstream `main` has no per-room recipient control either
 (`BaseClient::share_room_key` reads `get_user_ids` with the client's
 strategy). Filow calls the method before each AI send.
 
-Test: `test_room_keys_shared_only_with_own_user` in
-`crates/matrix-sdk-base/src/client.rs`. In Filow,
+Tests: `test_room_keys_shared_only_with_own_user` in
+`crates/matrix-sdk-base/src/client.rs`; in
+`crates/matrix-sdk/tests/integration/encryption/own_user_only_room_keys.rs`,
+a key shared with Bob before the mark, and one being sent to Bob while the
+room is marked, never encrypt the next event. In Filow,
 `a_member_landed_between_the_check_and_the_share_gets_no_ai_room_key`
 (`client_core/src/matrix/send.rs`) is red without the patch (the bot landed
 mid-send gets the room key) and green with it.

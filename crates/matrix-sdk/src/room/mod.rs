@@ -2446,11 +2446,21 @@ impl Room {
     /// else before it is (Filow patch 3, `FILOW.md`).
     ///
     /// The client's room-key recipient strategy still picks which of the own
-    /// user's devices get the key. An outbound session already shared with
-    /// another user is rotated at the next share. There is no way back.
+    /// user's devices get the key. An outbound session another user holds,
+    /// or is being sent, is discarded here, and an event is sent only under
+    /// a session no one else holds: one a share running concurrently gave
+    /// to someone else is rotated before the event leaves. There is no way
+    /// back.
     #[cfg(feature = "e2e-encryption")]
-    pub fn share_room_keys_only_with_own_user(&self) {
+    pub async fn share_room_keys_only_with_own_user(&self) -> Result<()> {
         self.client.base_client().share_room_keys_only_with_own_user(self.room_id());
+        let olm = self.client.olm_machine().await;
+        if let Some(olm) = olm.as_ref()
+            && !olm.room_key_shared_only_with_own_user(self.room_id(), None).await
+        {
+            olm.discard_room_key(self.room_id()).await?;
+        }
+        Ok(())
     }
 
     /// Share a group session for a room.

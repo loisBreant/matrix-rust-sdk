@@ -173,6 +173,24 @@ impl GroupSessionManager {
         }
     }
 
+    /// Whether the room's outbound session holds as one only `user_id`'s
+    /// devices can have: it exists, is not invalidated, is `session_id` when
+    /// one is given, and every user it was shared with, or is being shared
+    /// with (requests not sent yet), is `user_id` (Filow patch 3).
+    pub async fn room_key_shared_only_with(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        session_id: Option<&str>,
+    ) -> bool {
+        let Some(session) = self.sessions.get_or_load(room_id).await else {
+            return false;
+        };
+        !session.invalidated()
+            && session_id.is_none_or(|id| session.session_id() == id)
+            && session.sharing_view().shared_with_users().all(|shared| shared == user_id)
+    }
+
     pub async fn mark_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
         let Some(session) = self.sessions.remove_from_being_shared(request_id) else {
             return Ok(());

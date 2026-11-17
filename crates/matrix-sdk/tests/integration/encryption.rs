@@ -1,6 +1,7 @@
 mod backups;
 mod cross_signing;
 mod dehydrated_devices;
+mod own_user_only_room_keys;
 mod recovery;
 mod secret_storage;
 mod shared_history;
