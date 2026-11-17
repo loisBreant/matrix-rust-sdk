@@ -7,7 +7,8 @@ in the `[patch.crates-io]` tables of `client_core/Cargo.toml` and
 here and a new pin there.
 
 Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
-https://github.com/loisBreant/Filow/issues/537 (patch 2)
+https://github.com/loisBreant/Filow/issues/537 (patch 2),
+https://github.com/loisBreant/Filow/issues/1560 (patch 3)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -80,6 +81,42 @@ Test: `test_fallback_key_rotation_on_request` in `olm/account.rs`. In Filow,
 `a_claim_after_a_restore_epoch_gets_a_fallback_key_the_device_holds`
 (`client_core/src/key_backup/integration_tests.rs`) is red without the
 rotation and green with it.
+
+## Patch 3: share a room's key only with the own user's devices
+
+`crates/matrix-sdk-base/src/client.rs` and `crates/matrix-sdk/src/room/mod.rs`:
+`Room::share_room_keys_only_with_own_user` (and
+`BaseClient::share_room_keys_only_with_own_user`) marks a room, for as long as
+the client lives, so that the users whose devices get its room key are only
+the own user, whatever the room's member list says when the key is shared.
+`BaseClient::room_key_recipient_users` is the one place the list is made, and
+the three readers of the member list on the send path use it:
+`BaseClient::share_room_key`, the one-time-key claim in
+`Room::preshare_room_key`, and `Room::query_keys_for_untracked_or_dirty_users`.
+The client's `CollectStrategy` still picks which of the own user's devices
+get the key; an outbound session already shared with someone else is rotated
+at the next share, as for a member who left. The mark is in memory, shared
+with `clone_with_in_memory_state_store` copies, and has no way back.
+
+### Why Filow needs it
+
+Filow keeps a user's AI conversations in a private Megolm room only the user
+is in (Filow ADR 0102). Filow's strategy is `OnlyTrustedDevices`, which also
+keys the devices of the bridge bots Filow pins (Filow ADR 0089), so it would
+key a pinned bot the homeserver lists as a member. Filow checks the member
+list before it sends, but the share reads the state store again, inside
+`send_raw`, and a sync can land a member in between. The strategy is
+client-wide (`ClientBuilder::with_room_key_recipient_strategy`) and the member
+list is read inside the SDK, so neither can be narrowed for one room from
+outside; upstream `main` has no per-room recipient control either
+(`BaseClient::share_room_key` reads `get_user_ids` with the client's
+strategy). Filow calls the method before each AI send.
+
+Test: `test_room_keys_shared_only_with_own_user` in
+`crates/matrix-sdk-base/src/client.rs`. In Filow,
+`a_member_landed_between_the_check_and_the_share_gets_no_ai_room_key`
+(`client_core/src/matrix/send.rs`) is red without the patch (the bot landed
+mid-send gets the room key) and green with it.
 
 ## Dependency bump: rusqlite 0.42.0
 

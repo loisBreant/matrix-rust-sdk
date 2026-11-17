@@ -24,6 +24,8 @@ use std::{
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::Stream;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_common::locks::RwLock as SyncRwLock;
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "experimental-x509-identity-verification")]
 use matrix_sdk_crypto::x509::{RawX509Signer, RawX509Verifier};
@@ -132,6 +134,12 @@ pub struct BaseClient {
     #[cfg(feature = "e2e-encryption")]
     pub room_key_recipient_strategy: CollectStrategy,
 
+    /// The rooms whose room keys go only to the own user's devices, whatever
+    /// their member list says (Filow patch, see
+    /// [`BaseClient::share_room_keys_only_with_own_user`]).
+    #[cfg(feature = "e2e-encryption")]
+    own_user_only_room_keys: Arc<SyncRwLock<BTreeSet<OwnedRoomId>>>,
+
     /// The settings to use for decrypting events.
     #[cfg(feature = "e2e-encryption")]
     pub decryption_settings: DecryptionSettings,
@@ -220,6 +228,8 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
             #[cfg(feature = "e2e-encryption")]
+            own_user_only_room_keys: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
             decryption_settings: DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
             },
@@ -260,6 +270,7 @@ impl BaseClient {
             ignore_user_list_changes: Default::default(),
             global_profile_updates_sender: broadcast::Sender::new(16),
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
+            own_user_only_room_keys: self.own_user_only_room_keys.clone(),
             decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
             threading_support: self.threading_support,
@@ -1063,7 +1074,7 @@ impl BaseClient {
                     RoomMemberships::ACTIVE
                 };
 
-                let members = self.state_store.get_user_ids(room_id, filter).await?;
+                let members = self.room_key_recipient_users(room_id, filter).await?;
 
                 let Some(settings) = EncryptionSettings::from_possibly_redacted(
                     room_encryption_event,
@@ -1077,6 +1088,45 @@ impl BaseClient {
             }
             None => panic!("Olm machine wasn't started"),
         }
+    }
+
+    /// From now on, and for as long as this client lives, share the room key
+    /// of `room_id` only with the own user's devices, whatever the room's
+    /// member list says when the key is shared (Filow patch 3, `FILOW.md`).
+    ///
+    /// The share strategy still picks which of the own user's devices get it,
+    /// and an outbound session already shared with someone else is rotated
+    /// at the next share, as for a member who left. There is no way back: a
+    /// room is never returned to its members.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn share_room_keys_only_with_own_user(&self, room_id: &RoomId) {
+        self.own_user_only_room_keys.write().insert(room_id.to_owned());
+    }
+
+    /// Whether [`BaseClient::share_room_keys_only_with_own_user`] was called
+    /// for `room_id`.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn room_keys_shared_only_with_own_user(&self, room_id: &RoomId) -> bool {
+        self.own_user_only_room_keys.read().contains(room_id)
+    }
+
+    /// The users whose devices a room key of `room_id` is shared with, or who
+    /// are queried and claimed for before it is: the members of `room_id`
+    /// with `memberships`, or only the own user once
+    /// [`BaseClient::share_room_keys_only_with_own_user`] was called for it.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn room_key_recipient_users(
+        &self,
+        room_id: &RoomId,
+        memberships: RoomMemberships,
+    ) -> Result<Vec<OwnedUserId>> {
+        if self.room_keys_shared_only_with_own_user(room_id) {
+            let Some(session_meta) = self.session_meta() else {
+                return Err(Error::InsufficientData);
+            };
+            return Ok(vec![session_meta.user_id.clone()]);
+        }
+        Ok(self.state_store.get_user_ids(room_id, memberships).await?)
     }
 
     /// Get the room with the given room id.
@@ -1536,6 +1586,58 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_room_keys_shared_only_with_own_user() {
+        use matrix_sdk_test::JoinedRoomBuilder;
+
+        let user_id = user_id!("@alice:example.org");
+        let room_id = room_id!("!ai:example.org");
+        let other_room_id = room_id!("!chat:example.org");
+
+        let client = logged_in_base_client(Some(user_id)).await;
+        let f = EventFactory::new();
+        let bob = *BOB;
+        let joined = |user: &ruma::UserId| f.member(user).membership(MembershipState::Join);
+        let response = SyncResponseBuilder::new()
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(joined(user_id))
+                    .add_state_event(joined(bob)),
+            )
+            .add_joined_room(
+                JoinedRoomBuilder::new(other_room_id)
+                    .add_state_event(joined(user_id))
+                    .add_state_event(joined(bob)),
+            )
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        let recipients =
+            |room_id| client.room_key_recipient_users(room_id, crate::RoomMemberships::JOIN);
+        let mut members = recipients(room_id).await.unwrap();
+        members.sort();
+        let mut expected = vec![user_id.to_owned(), bob.to_owned()];
+        expected.sort();
+        assert_eq!(members, expected);
+
+        assert!(!client.room_keys_shared_only_with_own_user(room_id));
+        client.share_room_keys_only_with_own_user(room_id);
+        assert!(client.room_keys_shared_only_with_own_user(room_id));
+
+        // Only the own user, whoever the member list names, and only in the
+        // room it was asked for.
+        assert_eq!(recipients(room_id).await.unwrap(), vec![user_id.to_owned()]);
+        assert_eq!(recipients(other_room_id).await.unwrap().len(), 2);
+
+        // Shared with the client's copies, which use the same `OlmMachine`.
+        let copy = client
+            .clone_with_in_memory_state_store(CrossProcessLockConfig::SingleProcess, false)
+            .await
+            .unwrap();
+        assert!(copy.room_keys_shared_only_with_own_user(room_id));
     }
 
     #[async_test]

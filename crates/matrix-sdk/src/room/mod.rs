@@ -2416,8 +2416,8 @@ impl Room {
                 {
                     let members = self
                         .client
-                        .state_store()
-                        .get_user_ids(self.room_id(), RoomMemberships::ACTIVE)
+                        .base_client()
+                        .room_key_recipient_users(self.room_id(), RoomMemberships::ACTIVE)
                         .await?;
                     self.client.claim_one_time_keys(members.iter().map(Deref::deref)).await?;
                 };
@@ -2438,6 +2438,19 @@ impl Room {
                 Ok(())
             })
             .await
+    }
+
+    /// From now on, and for as long as the client lives, share this room's
+    /// room key only with the own user's devices, whatever the room's member
+    /// list says when the key is shared, and query and claim keys for no one
+    /// else before it is (Filow patch 3, `FILOW.md`).
+    ///
+    /// The client's room-key recipient strategy still picks which of the own
+    /// user's devices get the key. An outbound session already shared with
+    /// another user is rotated at the next share. There is no way back.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn share_room_keys_only_with_own_user(&self) {
+        self.client.base_client().share_room_keys_only_with_own_user(self.room_id());
     }
 
     /// Share a group session for a room.
@@ -2558,8 +2571,11 @@ impl Room {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().expect("Olm machine wasn't started");
 
-        let members =
-            self.client.state_store().get_user_ids(self.room_id(), RoomMemberships::ACTIVE).await?;
+        let members = self
+            .client
+            .base_client()
+            .room_key_recipient_users(self.room_id(), RoomMemberships::ACTIVE)
+            .await?;
 
         let tracked: HashMap<_, _> = olm
             .store()
