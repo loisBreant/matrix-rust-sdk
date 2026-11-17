@@ -2455,10 +2455,8 @@ impl Room {
     pub async fn share_room_keys_only_with_own_user(&self) -> Result<()> {
         self.client.base_client().share_room_keys_only_with_own_user(self.room_id());
         let olm = self.client.olm_machine().await;
-        if let Some(olm) = olm.as_ref()
-            && !olm.room_key_shared_only_with_own_user(self.room_id(), None).await
-        {
-            olm.discard_room_key(self.room_id()).await?;
+        if let Some(olm) = olm.as_ref() {
+            olm.discard_room_key_shared_beyond_own_user(self.room_id()).await?;
         }
         Ok(())
     }

@@ -407,7 +407,8 @@ pub enum Error {
 
     /// A room whose keys go only to the own user's devices
     /// (`Room::share_room_keys_only_with_own_user`, Filow patch 3) still had
-    /// a room key someone else holds after it was rotated; nothing was sent.
+    /// no room key only they hold after it was rotated once; nothing was
+    /// sent.
     #[error("the room key reached someone other than the own user")]
     RoomKeySharedBeyondOwnUser,
 }

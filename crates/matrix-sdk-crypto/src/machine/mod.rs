@@ -1353,18 +1353,30 @@ impl OlmMachine {
     }
 
     /// Whether the outbound room key of `room_id` holds as one only the own
-    /// user's devices can have (Filow patch 3): it exists, is not
-    /// invalidated, is `session_id` when one is given, and no other user
-    /// received it or has a request pending to receive it. A room key
-    /// shared later gives its receiver only the session's later messages.
+    /// user's devices can have (Filow patch 3): it is `session_id`, is not
+    /// invalidated, and no other user received it or has a request pending
+    /// to receive it.
     pub async fn room_key_shared_only_with_own_user(
         &self,
         room_id: &RoomId,
-        session_id: Option<&str>,
+        session_id: &str,
     ) -> bool {
         self.inner
             .group_session_manager
             .room_key_shared_only_with(room_id, self.user_id(), session_id)
+            .await
+    }
+
+    /// Discards the outbound room key of `room_id` if another user received
+    /// it or has a request pending to receive it (Filow patch 3). Returns
+    /// whether it did.
+    pub async fn discard_room_key_shared_beyond_own_user(
+        &self,
+        room_id: &RoomId,
+    ) -> StoreResult<bool> {
+        self.inner
+            .group_session_manager
+            .invalidate_group_session_shared_beyond(room_id, self.user_id())
             .await
     }
 

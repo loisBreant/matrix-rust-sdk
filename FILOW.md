@@ -110,8 +110,16 @@ A key someone else holds never encrypts an event sent after the mark:
   and nothing is sent. This closes the race the mark alone leaves: a share
   that read the member list before the mark, or that the send joined through
   `group_session_deduplicated_handler`, can still give the session to another
-  member. Checking after encrypting is sound because a session shared later
-  carries only its later messages.
+  member. The session id comes from the encryption result; a result without
+  one fails the check. Checking after encrypting is sound because a share
+  copies the room key early (`maybe_encrypt_room_key`) and records its
+  pending request late (`add_request`), and every share into the room runs
+  under this `Client`'s `group_session_deduplicated_handler`, which a send
+  waits on before it encrypts: a share that copied the key before the
+  encryption has recorded its request by the time of the check, and one
+  that copies it later carries only later messages. Notification and other
+  cloned clients share the mark but not that lock, so the guarantee holds
+  only while the room's events are sent from one `Client`.
 - Not covered: `send_state_event` encryption (`experimental-encrypted-state-events`,
   which Filow does not enable).
 

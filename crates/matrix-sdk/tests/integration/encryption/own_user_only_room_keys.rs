@@ -97,7 +97,7 @@ async fn test_a_room_key_shared_before_the_mark_never_encrypts_the_next_event() 
     {
         let olm = alice.olm_machine_for_testing().await;
         let olm = olm.as_ref().unwrap();
-        assert!(!olm.room_key_shared_only_with_own_user(room_id, Some(&before[0])).await);
+        assert!(!olm.room_key_shared_only_with_own_user(room_id, &before[0]).await);
     }
     let marked_at = server.server().received_requests().await.unwrap().len();
 
@@ -123,7 +123,7 @@ async fn test_a_room_key_shared_before_the_mark_never_encrypts_the_next_event() 
     assert_ne!(sessions[1], sessions[0], "the session Bob holds encrypted the next event");
     let olm = alice.olm_machine_for_testing().await;
     let olm = olm.as_ref().unwrap();
-    assert!(olm.room_key_shared_only_with_own_user(room_id, Some(&sessions[1])).await);
+    assert!(olm.room_key_shared_only_with_own_user(room_id, &sessions[1]).await);
     let bob_id = bob.user_id().unwrap().to_string();
     assert!(
         !room_key_recipients_after(&server, marked_at).await.contains(&bob_id),
@@ -196,5 +196,54 @@ async fn test_a_share_running_while_the_room_is_marked_never_encrypts_the_next_e
     assert!(
         !sessions.contains(&held),
         "an event left under the session Bob was being sent: {sessions:?}"
+    );
+}
+
+#[async_test]
+async fn test_a_send_that_finds_no_own_user_only_room_key_twice_sends_nothing() {
+    let room_id = room_id!("!ai:example.org");
+    let server = MatrixMockServer::new().await;
+    let (alice, _bob) = alice_and_bob_in_a_room(&server, room_id).await;
+    // A second device of Alice's, so every own-user-only share sends a
+    // request the test can hold.
+    let _alice_two =
+        server.set_up_new_device_for_encryption(&alice, ruma::device_id!("ALICETWO"), vec![]).await;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/v3/sendToDevice/.*/.*"))
+        .respond_with(HeldShare { reached: reached.clone(), delay: Duration::from_secs(1) })
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(server.server())
+        .await;
+    mount_send_to_device(&server).await;
+    let room = alice.get_room(room_id).unwrap();
+    room.share_room_keys_only_with_own_user().await.unwrap();
+    let marked_at = server.server().received_requests().await.unwrap().len();
+
+    // Each share's session is invalidated while it is being sent, so the
+    // check after encrypting fails, the rotation's session fails it too, and
+    // the send must stop there.
+    let send = room.send(RoomMessageEventContent::text_plain("never sent"));
+    let spoil = async {
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .expect("a share reached the server");
+            let olm = alice.olm_machine_for_testing().await;
+            assert!(olm.as_ref().unwrap().discard_room_key(room_id).await.unwrap());
+        }
+    };
+    let (sent, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(send.into_future(), spoil)
+    })
+    .await
+    .expect("the send finishes");
+
+    assert!(matches!(sent, Err(matrix_sdk::Error::RoomKeySharedBeyondOwnUser)), "{sent:?}");
+    let requests = server.server().received_requests().await.unwrap();
+    assert!(
+        !requests[marked_at..].iter().any(|request| request.url.path().contains("/send/")),
+        "an event left"
     );
 }

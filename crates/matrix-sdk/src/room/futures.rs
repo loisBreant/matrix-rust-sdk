@@ -233,14 +233,15 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     for attempt in 0..2 {
                         let guard = room.client.olm_machine().await;
                         let olm = guard.as_ref().expect("Olm machine wasn't started");
-                        let session_id = encrypted_session_id(&result.content);
-                        if olm
-                            .room_key_shared_only_with_own_user(
-                                room.room_id(),
-                                session_id.as_deref(),
-                            )
-                            .await
-                        {
+                        // A result without a Megolm session id fails the check.
+                        let holds = match result.encryption_info.session_id() {
+                            Some(session_id) => {
+                                olm.room_key_shared_only_with_own_user(room.room_id(), session_id)
+                                    .await
+                            }
+                            None => false,
+                        };
+                        if holds {
                             break;
                         }
                         if attempt == 1 {
@@ -550,12 +551,6 @@ impl<'a> IntoFuture for SendStateEvent<'a> {
                 .await
         })
     }
-}
-
-/// The Megolm session an encrypted event was encrypted with.
-#[cfg(feature = "e2e-encryption")]
-fn encrypted_session_id<T>(content: &Raw<T>) -> Option<String> {
-    content.get_field::<String>("session_id").ok().flatten()
 }
 
 /// Ensures the room is ready for encrypted events to be sent.

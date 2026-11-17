@@ -174,21 +174,41 @@ impl GroupSessionManager {
     }
 
     /// Whether the room's outbound session holds as one only `user_id`'s
-    /// devices can have: it exists, is not invalidated, is `session_id` when
-    /// one is given, and every user it was shared with, or is being shared
-    /// with (requests not sent yet), is `user_id` (Filow patch 3).
+    /// devices can have: it exists, is `session_id`, is not invalidated, and
+    /// every user it was shared with, or is being shared with (requests not
+    /// sent yet), is `user_id` (Filow patch 3).
     pub async fn room_key_shared_only_with(
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-        session_id: Option<&str>,
+        session_id: &str,
     ) -> bool {
         let Some(session) = self.sessions.get_or_load(room_id).await else {
             return false;
         };
-        !session.invalidated()
-            && session_id.is_none_or(|id| session.session_id() == id)
-            && session.sharing_view().shared_with_users().all(|shared| shared == user_id)
+        session.session_id() == session_id
+            && !session.invalidated()
+            && Self::shared_only_with(&session, user_id)
+    }
+
+    /// Invalidates the room's outbound session if a user other than
+    /// `user_id` received it or has a request pending to receive it (Filow
+    /// patch 3). Returns whether it did.
+    pub async fn invalidate_group_session_shared_beyond(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> StoreResult<bool> {
+        match self.sessions.get_or_load(room_id).await {
+            Some(session) if !Self::shared_only_with(&session, user_id) => {
+                self.invalidate_group_session(room_id).await
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn shared_only_with(session: &OutboundGroupSession, user_id: &UserId) -> bool {
+        session.sharing_view().shared_with_users().all(|shared| shared == user_id)
     }
 
     pub async fn mark_request_as_sent(&self, request_id: &TransactionId) -> StoreResult<()> {
