@@ -9,7 +9,8 @@ here and a new pin there.
 Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
 https://github.com/loisBreant/Filow/issues/537 (patch 2),
 https://github.com/loisBreant/Filow/issues/1560 (patch 3),
-https://github.com/loisBreant/Filow/issues/1685 (patches 4 and 5)
+https://github.com/loisBreant/Filow/issues/1685 (patches 4 and 5),
+https://github.com/loisBreant/Filow/issues/1691 (patch 6)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -296,6 +297,52 @@ with it (`test_secret_broadcasting`, whose request the feature does not
 make, runs without it only). The whole matrix-sdk-crypto library suite
 passes both ways. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_device`
 (`client_core/src/key_backup/gossip_tests.rs`) is red without the feature.
+
+## Patch 6: hold room-key uploads to the backup until released
+
+`crates/matrix-sdk/src/encryption/backups/{mod,types,futures}.rs`, additive:
+`Backups::hold_uploads()`, `Backups::release_uploads()` and
+`Backups::uploads_held()`. While held, `backup_room_keys` (the one place
+room keys are sent to the backup, which the upload task, sync and sliding
+sync all trigger) sends nothing and leaves them marked not backed up;
+`release_uploads()` lets them go and triggers an upload of what arrived
+meanwhile. `wait_for_steady_state()` returns `SteadyStateError::BackupDisabled`
+at once while held, rather than wait for a release. The hold lives in this
+`Client`'s memory: a client built again starts with uploads not held, so
+upstream behaviour is unchanged unless the caller holds them. An upload
+already sent when the hold is placed is not recalled.
+
+### Why Filow needs it
+
+A device resumes the backup key it stores when it starts: the
+`OlmMachine` loads it when it is built, and the post-login task
+(`Backups::setup_and_resume`) enables it, without asking anyone whether it
+is still the key to back up with. Filow checks that key against its
+key-backup wrap, sealed under the account key, but that check runs beside
+the first syncs, which deliver room keys and trigger their upload. A
+device left on a retired backup version (it missed a revocation's
+rotation) whose homeserver makes that version current again, label and
+key, uploads the room keys of its first syncs to a key the revoked device
+knows, and the homeserver can stall or fail only the check's own requests
+so that it never settles (Filow #1691, found in the review of Filow
+#1685). Filow holds uploads as soon as it builds a client, before the
+session is restored, and releases them only once its check vouches for the
+key the device backs up with. Holding uploads rather than not resuming the
+key leaves every other behaviour of a resumed backup as it was (the key is
+still enabled and still used to download), and nothing is lost: the keys
+held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
+2026-11-18) has no way to keep a resumed backup from uploading:
+`resume_backup_from_stored_backup_key` and `backup_room_keys` are unchanged.
+
+Tests: `test_held_uploads_wait_for_their_release` and
+`test_uploads_are_not_held_by_default` in `encryption/backups/mod.rs`;
+`test_resumed_backup_uploads_nothing_while_held` in
+`tests/integration/encryption/backups.rs` (a client restarted from its
+SQLite store, holding uploads before it restores its session, resumes its
+key and sends no room key, not even after a sync, until released). In
+Filow, `a_restarted_device_backs_no_room_key_up_before_its_check`
+(`client_core/src/key_backup/cross_signing_tests.rs`) is red without the
+hold.
 
 ## Dependency bump: rusqlite 0.42.0
 

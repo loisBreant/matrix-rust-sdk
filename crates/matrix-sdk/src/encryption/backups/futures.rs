@@ -30,10 +30,11 @@ use crate::utils::ChannelObservable;
 /// can fail.
 #[derive(Clone, Copy, Debug, Error)]
 pub enum SteadyStateError {
-    /// The currently active backup got either deleted or a new one was created.
+    /// The currently active backup got either deleted or a new one was created,
+    /// or uploads are held ([`Backups::hold_uploads()`], Filow patch 6).
     ///
     /// No further room keys will be uploaded to the currently active
-    /// backup.
+    /// backup, until a held upload is released.
     #[error("The backup got disabled while waiting for the room keys to be uploaded.")]
     BackupDisabled,
     /// Uploading the room keys to the homeserver failed due to a network error.
@@ -110,7 +111,11 @@ impl<'a> IntoFuture for WaitForSteadyState<'a> {
 
             trace!("Waiting for the upload steady state");
 
-            let ret = if backups.are_enabled().await {
+            // Filow patch 6: held uploads reach no steady state until
+            // released; waiting would hang.
+            let ret = if backups.uploads_held() {
+                Err(SteadyStateError::BackupDisabled)
+            } else if backups.are_enabled().await {
                 backups.maybe_trigger_backup();
 
                 let mut ret = Ok(());
@@ -137,6 +142,10 @@ impl<'a> IntoFuture for WaitForSteadyState<'a> {
                         }
                         Err(_) => {
                             ret = Err(SteadyStateError::Lagged);
+                            break;
+                        }
+                        Ok(UploadState::Idle) if backups.uploads_held() => {
+                            ret = Err(SteadyStateError::BackupDisabled);
                             break;
                         }
                         _ => (),

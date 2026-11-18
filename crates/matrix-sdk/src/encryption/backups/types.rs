@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -61,6 +61,10 @@ pub(crate) struct BackupClientState {
     /// on the server was changed by some other client, we will have a old
     /// value.
     pub(super) backup_exists_on_server: RwLock<Option<bool>>,
+
+    /// Whether uploads of room keys to the backup are held until
+    /// [`Backups::release_uploads()`] (Filow patch 6).
+    pub(super) uploads_held: AtomicBool,
 }
 
 impl BackupClientState {
@@ -96,6 +100,7 @@ impl Default for BackupClientState {
             global_state: Default::default(),
             room_keys_broadcaster: broadcast::Sender::new(100),
             backup_exists_on_server: RwLock::new(None),
+            uploads_held: AtomicBool::new(false),
         }
     }
 }

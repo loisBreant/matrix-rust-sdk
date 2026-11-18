@@ -20,7 +20,10 @@
 //!
 //! [1]: https://spec.matrix.org/unstable/client-server-api/#server-side-key-backups
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::Ordering,
+};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -410,6 +413,38 @@ impl Backups {
     /// Get the current [`BackupState`] for this [`Client`].
     pub fn state(&self) -> BackupState {
         self.client.inner.e2ee.backup_state.global_state.get()
+    }
+
+    /// Hold every upload of room keys to the backup, until
+    /// [`Backups::release_uploads()`]. Room keys keep arriving and are stored
+    /// as not backed up, so nothing is lost: they are uploaded once released.
+    /// An upload already sent is not recalled. Holds for this [`Client`]
+    /// only, in memory: a client built again starts with uploads not held.
+    ///
+    /// Filow patch 6: a device resumes the backup key it stores when it
+    /// starts (the [`OlmMachine`] loads it, and the post-login task enables
+    /// it), without asking anyone whether it is still the key to back up
+    /// with. A homeserver can make a backup version the device stores
+    /// current again (label and key), one a device revoked since knows. The
+    /// caller holds uploads before the client restores its session, and
+    /// releases them once it has checked the key against what it trusts.
+    pub fn hold_uploads(&self) {
+        self.client.inner.e2ee.backup_state.uploads_held.store(true, Ordering::SeqCst);
+    }
+
+    /// Let room keys reach the backup again after [`Backups::hold_uploads()`],
+    /// starting with those that arrived meanwhile. Does nothing to uploads
+    /// that were not held.
+    pub fn release_uploads(&self) {
+        if self.client.inner.e2ee.backup_state.uploads_held.swap(false, Ordering::SeqCst) {
+            self.maybe_trigger_backup();
+        }
+    }
+
+    /// Whether uploads of room keys to the backup are held
+    /// ([`Backups::hold_uploads()`]).
+    pub fn uploads_held(&self) -> bool {
+        self.client.inner.e2ee.backup_state.uploads_held.load(Ordering::SeqCst)
     }
 
     /// The public half (unpadded base64, as a backup version's
@@ -859,7 +894,16 @@ impl Backups {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        while let Some((request_id, request)) = olm_machine.backup_machine().backup().await? {
+        loop {
+            // Filow patch 6: while held, the room keys stay marked not backed
+            // up, and no steady state is claimed.
+            if self.uploads_held() {
+                trace!("Uploads to the backup are held");
+                return Ok(());
+            }
+            let Some((request_id, request)) = olm_machine.backup_machine().backup().await? else {
+                break;
+            };
             self.send_backup_request(olm_machine, &request_id, request).await?;
         }
 
@@ -1682,6 +1726,137 @@ mod test {
             .expect("We should be able to check if backups exist on the server");
 
         assert!(!exists, "But now there is no backup");
+    }
+
+    // Filow patch 6: held uploads send nothing, and claim no steady state,
+    // until released; then the room keys that arrived meanwhile go up.
+    #[async_test]
+    async fn test_held_uploads_wait_for_their_release() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        let upload = || {
+            Mock::given(method("PUT"))
+                .and(wiremock::matchers::path_regex("room_keys/keys$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({ "etag": "1", "count": 1 })),
+                )
+        };
+
+        backups.hold_uploads();
+        assert!(backups.uploads_held());
+
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
+        backups.create().await.expect("We should be able to create a new backup");
+        {
+            let machine = client.olm_machine().await;
+            machine
+                .as_ref()
+                .unwrap()
+                .store()
+                .import_exported_room_keys(vec![room_key()], |_, _| {})
+                .await
+                .expect("We should be able to import a room key");
+        }
+
+        {
+            let _none = upload()
+                .expect(0)
+                .named("no upload while held")
+                .mount_as_scoped(server.server())
+                .await;
+            backups.backup_room_keys().await.expect("a held upload is no error");
+            assert_matches!(
+                backups.wait_for_steady_state().await,
+                Err(futures::SteadyStateError::BackupDisabled)
+            );
+            let machine = client.olm_machine().await;
+            let counts =
+                machine.as_ref().unwrap().backup_machine().room_key_counts().await.unwrap();
+            assert_eq!(counts.backed_up, 0);
+        }
+
+        let _one = upload()
+            .expect(1)
+            .named("the held key, once released")
+            .mount_as_scoped(server.server())
+            .await;
+        backups.release_uploads();
+        assert!(!backups.uploads_held());
+        // Released, the key goes up on its own, with nobody waiting for it.
+        let uploaded = async {
+            loop {
+                let machine = client.olm_machine().await;
+                let counts =
+                    machine.as_ref().unwrap().backup_machine().room_key_counts().await.unwrap();
+                if counts.backed_up == 1 {
+                    break;
+                }
+                drop(machine);
+                crate::sleep::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        matrix_sdk_common::timeout::timeout(uploaded, Duration::from_secs(5))
+            .await
+            .expect("the held room key goes up once released");
+        backups.wait_for_steady_state().await.expect("a steady state once released");
+    }
+
+    // Filow patch 6: a hold placed while someone waits for the steady state
+    // ends the wait rather than leave it hanging.
+    #[async_test]
+    async fn test_a_hold_placed_while_waiting_ends_the_wait() {
+        use std::future::IntoFuture;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex("room_keys/keys$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "etag": "1", "count": 1 }))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(server.server())
+            .await;
+        backups.create().await.expect("We should be able to create a new backup");
+        {
+            let machine = client.olm_machine().await;
+            machine
+                .as_ref()
+                .unwrap()
+                .store()
+                .import_exported_room_keys(vec![room_key()], |_, _| {})
+                .await
+                .expect("We should be able to import a room key");
+        }
+
+        let wait = backups.wait_for_steady_state();
+        let hold = async {
+            crate::sleep::sleep(Duration::from_millis(100)).await;
+            backups.hold_uploads();
+        };
+        let (waited, ()) = futures_util::join!(
+            matrix_sdk_common::timeout::timeout(wait.into_future(), Duration::from_secs(5)),
+            hold
+        );
+        assert_matches!(
+            waited.expect("the wait ends"),
+            Err(futures::SteadyStateError::BackupDisabled)
+        );
+    }
+
+    // Filow patch 6: without a hold, nothing changes.
+    #[async_test]
+    async fn test_uploads_are_not_held_by_default() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        assert!(!backups.uploads_held());
+        backups.release_uploads();
+        assert!(!backups.uploads_held());
     }
 
     #[async_test]

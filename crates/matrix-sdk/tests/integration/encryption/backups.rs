@@ -421,6 +421,75 @@ async fn test_backup_resumption() -> TestResult {
     Ok(())
 }
 
+/// Filow patch 6: a client that holds uploads before it restores its session
+/// resumes the backup key it stores, but sends no room key to it, not even
+/// one a sync delivered, until it releases them.
+#[async_test]
+#[cfg(feature = "sqlite")]
+async fn test_resumed_backup_uploads_nothing_while_held() -> TestResult {
+    let dir = tempdir()?;
+
+    let (builder, server) = test_client_builder_with_server().await;
+    let client = builder
+        .request_config(RequestConfig::new().disable_retry())
+        .sqlite_store(dir.path(), None)
+        .build()
+        .await?;
+    let session = matrix_session_example();
+
+    Mock::given(method("POST"))
+        .and(path("_matrix/client/unstable/room_keys/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    client.restore_session(session.to_owned()).await?;
+    client.encryption().backups().create().await.expect("We should be able to create a new backup");
+    drop(client);
+
+    let client = Client::builder()
+        .homeserver_url(server.uri())
+        .server_versions([ruma::api::MatrixVersion::V1_0])
+        .request_config(RequestConfig::new().disable_retry())
+        .sqlite_store(dir.path(), None)
+        .build()
+        .await?;
+    client.encryption().backups().hold_uploads();
+    client.restore_session(session).await?;
+    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    assert!(client.encryption().backups().are_enabled().await, "the stored key is resumed");
+
+    let upload = || {
+        Mock::given(method("PUT")).and(path("_matrix/client/unstable/room_keys/keys")).respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "etag": "abcdefg" })),
+        )
+    };
+    let dir_keys = tempdir()?;
+    let room_key_path = dir_keys.path().join("room_key.txt");
+    File::create(&room_key_path)?.write_all(ROOM_KEY)?;
+    {
+        let _none = upload().expect(0).named("no upload while held").mount_as_scoped(&server).await;
+        client.encryption().import_room_keys(room_key_path, "1234").await?;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/r0/sync"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "next_batch": "s1" })))
+            .mount(&server)
+            .await;
+        client.sync_once(Default::default()).await?;
+        assert_matches!(
+            client.encryption().backups().wait_for_steady_state().await,
+            Err(SteadyStateError::BackupDisabled)
+        );
+    }
+
+    let _one =
+        upload().expect(1).named("the held key, once released").mount_as_scoped(&server).await;
+    client.encryption().backups().release_uploads();
+    client.encryption().backups().wait_for_steady_state().await?;
+
+    Ok(())
+}
+
 async fn setup_backups(client: &Client, server: &wiremock::MockServer) {
     let dir = tempdir().unwrap();
     let mut room_key_path = dir.path().to_owned();
