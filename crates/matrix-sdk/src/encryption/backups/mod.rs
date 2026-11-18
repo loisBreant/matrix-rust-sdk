@@ -800,10 +800,36 @@ impl Backups {
     ///
     /// Returns true if backups were just enabled or were already enabled,
     /// otherwise false.
-    #[instrument(skip_all)]
     pub(crate) async fn maybe_enable_backups(
         &self,
         maybe_recovery_key: &str,
+    ) -> Result<bool, EnableBackupError> {
+        self.enable_backups_with(maybe_recovery_key, false).await
+    }
+
+    /// [`Backups::maybe_enable_backups()`], except that a backup already
+    /// enabled for the current version counts only when it uses this very
+    /// key and the homeserver serves this key's public half for that version.
+    /// Otherwise this key replaces the stored one if it is the current
+    /// version's, or [`EnableBackupError::InconsistentBackupDecryptionKey`] is
+    /// returned.
+    ///
+    /// Filow patch 4: the version is a label the homeserver chooses. A
+    /// homeserver serving a new backup version's public key under the label of
+    /// the version a device already backs up to would otherwise keep that
+    /// device encrypting room keys to its old backup key.
+    pub(crate) async fn enable_backups_with_key(
+        &self,
+        recovery_key: &str,
+    ) -> Result<bool, EnableBackupError> {
+        self.enable_backups_with(recovery_key, true).await
+    }
+
+    #[instrument(skip_all)]
+    async fn enable_backups_with(
+        &self,
+        maybe_recovery_key: &str,
+        exact_key: bool,
     ) -> Result<bool, EnableBackupError> {
         let _guard = self.client.locks().backup_modify_lock.lock().await;
 
@@ -836,8 +862,18 @@ impl Backups {
             let backup_info: RoomKeyBackupInfo = current_version.algorithm.deserialize_as()?;
             let stored_keys = backup_machine.get_backup_keys().await?;
 
+            // Filow patch 4: with `exact_key`, the stored key must be this one,
+            // and this one the version's.
+            let same_key = !exact_key
+                || (decryption_key.backup_key_matches(&backup_info)
+                    && stored_keys.decryption_key.as_ref().is_some_and(|stored| {
+                        stored.megolm_v1_public_key().to_base64()
+                            == decryption_key.megolm_v1_public_key().to_base64()
+                    }));
+
             if stored_keys.backup_version.as_ref() == Some(&current_version.version)
                 && self.are_enabled().await
+                && same_key
             {
                 // If we already have a backup enabled which is using the currently active
                 // backup version, do nothing but tell the caller using the return value that

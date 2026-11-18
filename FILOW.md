@@ -159,10 +159,15 @@ mid-send gets the room key) and green with it.
   published one of its usage, or none is imported), signs the own device when
   the self-signing key came in, and returns the `CrossSigningStatus`.
 - `SecretStore::import_backup_key(&str)`: the backup step of
-  `import_secrets()` on a key the caller already holds
-  (`Backups::maybe_enable_backups`, same error mapping:
-  `InconsistentBackupDecryptionKey` when the key is not the current
-  version's).
+  `import_secrets()` on a key the caller already holds, same error mapping
+  (`InconsistentBackupDecryptionKey` when the key is not the current
+  version's). Stricter than that step: a backup already enabled for the
+  current version is kept only if it uses this very key
+  (`Backups::enable_backups_with_key`); otherwise this key replaces it. The
+  version is a label the homeserver chooses, and serving a new key under the
+  label a device already backs up to would otherwise keep the device
+  encrypting room keys to its old key. `maybe_enable_backups`, which
+  `import_secrets()` uses, is unchanged.
 - `import_secrets()` now reads the secrets, then calls those two; its
   behaviour is unchanged (`secret_storage.rs`'s
   `test_restore_cross_signing_from_secret_store` still pins it).
@@ -198,7 +203,9 @@ homeserver to serve. The `CreateStore` options write each name at most once.
 Tests: `crates/matrix-sdk/tests/integration/encryption/secrets_from_memory.rs`
 (each import reads nothing from secret storage, a key of another identity or
 a malformed one imports nothing, a backup key that is not current is
-refused, each `CreateStore` option, and the unchanged defaults). In Filow,
+refused, a key served under the label of the version already enabled
+replaces the old one, each `CreateStore` option, and the unchanged
+defaults). In Filow,
 the #1685 tests in `client_core/src/key_backup/cross_signing_tests.rs` serve
 another ciphertext on every read after the first, and are red without the
 patch's use.

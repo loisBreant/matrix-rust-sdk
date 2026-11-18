@@ -113,6 +113,16 @@ async fn first_device(server: &MatrixMockServer) -> (Client, String) {
 
 /// The backup version the homeserver serves as current, under `key`.
 async fn mount_backup_version(server: &MatrixMockServer, key: &BackupDecryptionKey) {
+    mount_backup_version_with_priority(server, key, 5).await;
+}
+
+/// The same, taking over from a version mounted earlier when `priority` is
+/// lower (wiremock answers with the mock of the lowest priority).
+async fn mount_backup_version_with_priority(
+    server: &MatrixMockServer,
+    key: &BackupDecryptionKey,
+    priority: u8,
+) {
     let public_key = key.megolm_v1_public_key().to_base64();
     Mock::given(method("GET"))
         .and(path_regex(r"^/_matrix/client/.*/room_keys/version$"))
@@ -123,6 +133,7 @@ async fn mount_backup_version(server: &MatrixMockServer, key: &BackupDecryptionK
             "etag": "0",
             "version": "1",
         })))
+        .with_priority(priority)
         .mount(server.server())
         .await;
     Mock::given(method("PUT"))
@@ -386,4 +397,55 @@ async fn test_exporting_the_identity_leaves_the_backup_key_out() {
         stored_secret(&first, &key, SecretName::RecoveryKey).await,
         Some(own_backup.to_base64())
     );
+}
+
+/// The backup key this device stores, as the public half.
+async fn stored_backup_key(client: &Client) -> Option<String> {
+    let olm = client.olm_machine_for_testing().await;
+    let keys = olm.as_ref().unwrap().backup_machine().get_backup_keys().await.unwrap();
+    keys.decryption_key.map(|key| key.megolm_v1_public_key().to_base64())
+}
+
+// The homeserver labels a new backup key with the version a device already
+// backs up to: the device takes up the key it was given, and does not keep
+// encrypting room keys to its old one because the label did not change.
+#[async_test]
+async fn test_a_backup_key_given_replaces_one_enabled_under_the_same_version_label() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, old) = first_device_with_backup(&server).await;
+    let store = first.encryption().secret_storage().create_secret_store().await.unwrap();
+    let new = BackupDecryptionKey::new();
+    mount_backup_version_with_priority(&server, &new, 1).await;
+
+    // The old key is not the one the homeserver now serves for "1".
+    assert_matches!(
+        store.import_backup_key(&old.to_base64()).await,
+        Err(SecretStorageError::InconsistentBackupDecryptionKey)
+    );
+
+    store.import_backup_key(&new.to_base64()).await.unwrap();
+
+    assert!(first.encryption().backups().are_enabled().await);
+    assert_eq!(
+        stored_backup_key(&first).await,
+        Some(new.megolm_v1_public_key().to_base64()),
+        "kept the old key under the same version label"
+    );
+}
+
+// The same key for the same version changes nothing.
+#[async_test]
+async fn test_the_backup_key_already_enabled_is_kept() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, own) = first_device_with_backup(&server).await;
+    let store = first.encryption().secret_storage().create_secret_store().await.unwrap();
+
+    store.import_backup_key(&own.to_base64()).await.unwrap();
+
+    assert!(first.encryption().backups().are_enabled().await);
+    assert_eq!(stored_backup_key(&first).await, Some(own.megolm_v1_public_key().to_base64()));
 }

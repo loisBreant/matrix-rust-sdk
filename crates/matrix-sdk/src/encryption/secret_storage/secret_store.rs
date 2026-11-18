@@ -339,8 +339,10 @@ impl SecretStore {
     /// This is the second half of [`SecretStore::import_secrets()`]'s backup
     /// step, without reading `m.megolm_backup.v1` from the homeserver again:
     /// the key is used only if it matches the public key of the backup
-    /// version the homeserver serves as current, and nothing changes when
-    /// backups are already enabled for that version.
+    /// version the homeserver serves as current. Unlike `import_secrets()`,
+    /// a backup already enabled for that version is kept only if it uses this
+    /// very key: otherwise this key replaces it (the version label is the
+    /// homeserver's to choose).
     ///
     /// Filow patch 4: reading a secret once and importing that same value
     /// closes the gap between a caller's own check of the secret and
@@ -354,7 +356,7 @@ impl SecretStore {
     /// [`SecretStorageError::ImportError`] for any other failure.
     pub async fn import_backup_key(&self, backup_key: &str) -> Result<()> {
         let ret =
-            self.client.encryption().backups().maybe_enable_backups(backup_key).await.map_err(
+            self.client.encryption().backups().enable_backups_with_key(backup_key).await.map_err(
                 |e| match e {
                     EnableBackupError::InconsistentBackupDecryptionKey => {
                         SecretStorageError::InconsistentBackupDecryptionKey
