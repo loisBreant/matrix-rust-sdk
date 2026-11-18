@@ -449,3 +449,22 @@ async fn test_the_backup_key_already_enabled_is_kept() {
     assert!(first.encryption().backups().are_enabled().await);
     assert_eq!(stored_backup_key(&first).await, Some(own.megolm_v1_public_key().to_base64()));
 }
+
+#[async_test]
+async fn test_the_stored_backup_public_key_is_the_one_imported() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, key) = first_device(&server).await;
+    assert_eq!(first.encryption().backups().stored_backup_public_key().await.unwrap(), None);
+    let backup = BackupDecryptionKey::new();
+    mount_backup_version(&server, &backup).await;
+    let store = first.encryption().secret_storage().open_secret_store(&key).await.unwrap();
+
+    store.import_backup_key(&backup.to_base64()).await.unwrap();
+
+    assert_eq!(
+        first.encryption().backups().stored_backup_public_key().await.unwrap(),
+        Some(backup.megolm_v1_public_key().to_base64())
+    );
+}

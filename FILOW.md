@@ -171,6 +171,9 @@ mid-send gets the room key) and green with it.
 - `import_secrets()` now reads the secrets, then calls those two; its
   behaviour is unchanged (`secret_storage.rs`'s
   `test_restore_cross_signing_from_secret_store` still pins it).
+- `Backups::stored_backup_public_key()`: the public half of the backup
+  decryption key the device stores, so a caller can tell whether the device
+  backs up with another key than the one it trusts.
 - `SecretStore::export_cross_signing_keys()`: `export_secrets()` without the
   backup key. `export_secrets()` is that plus the backup key, as before.
 - `CreateStore::with_backup_key(&str)` stores the given backup key instead

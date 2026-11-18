@@ -391,6 +391,21 @@ impl Backups {
         self.client.inner.e2ee.backup_state.global_state.get()
     }
 
+    /// The public half (unpadded base64, as a backup version's
+    /// `auth_data.public_key` carries it) of the backup decryption key this
+    /// device stores, if it stores one.
+    ///
+    /// Filow patch 4: a caller that found the backup key it trusts is not the
+    /// current version's needs to know whether this device backs up with
+    /// another key the homeserver serves as current, to move it off that key.
+    pub async fn stored_backup_public_key(&self) -> Result<Option<String>, Error> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let keys = olm_machine.backup_machine().get_backup_keys().await?;
+
+        Ok(keys.decryption_key.map(|key| key.megolm_v1_public_key().to_base64()))
+    }
+
     /// Are backups enabled for the current [`Client`]?
     ///
     /// This method will check if we locally have an active backup key and
