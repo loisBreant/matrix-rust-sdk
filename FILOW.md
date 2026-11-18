@@ -9,7 +9,7 @@ here and a new pin there.
 Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
 https://github.com/loisBreant/Filow/issues/537 (patch 2),
 https://github.com/loisBreant/Filow/issues/1560 (patch 3),
-https://github.com/loisBreant/Filow/issues/1685 (patch 4)
+https://github.com/loisBreant/Filow/issues/1685 (patches 4 and 5)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -179,7 +179,26 @@ mid-send gets the room key) and green with it.
   current; room keys are marked not backed up, so they are all encrypted to
   it from then on. A persistent fail-closed for a device backing up with a
   key the caller no longer trusts and cannot rotate off: disabling does not
-  last, since matrix-sdk resumes the stored key at start.
+  last, since matrix-sdk resumes the stored key at start. Not atomic: it
+  stops the backup, stores the key, then enables it. A process stopped in
+  between resumes the key stored before at the next start, which only
+  means the caller's next check adopts the key again; nothing is lost and
+  nothing reaches a key the caller did not give.
+- `Backups::forget_backup_key()`: stop backing up, and remove the backup
+  decryption key and version the device stores, leaving the homeserver's
+  versions alone (and the secret inbox, which holds only secrets the device
+  asked for; Filow asks for none). Nothing is
+  resumed at the next start, and the device holds no backup key a device
+  asking for it could be served. `Backups::disable()` deletes the version on
+  the homeserver and leaves the key stored; `save_decryption_key(None,
+  None)` changes nothing (`None` means "unchanged"). Underneath:
+  `Changes::forget_backup_keys` in matrix-sdk-crypto, applied before a key
+  or version saved in the same changes, by the memory, SQLite and IndexedDB
+  stores, and `BackupMachine::forget_decryption_key()`.
+- `Backups::create_with_key(&str)`: `Backups::create()` with a backup
+  decryption key the caller chose, so it can record the key before the
+  homeserver hears of the version. With `create()` the key is known only
+  once the version exists and the device stores it.
 - `SecretStore::export_cross_signing_keys()`: `export_secrets()` without the
   backup key. `export_secrets()` is that plus the backup key, as before.
 - `CreateStore::with_backup_key(&str)` stores the given backup key instead
@@ -209,15 +228,60 @@ identity, and a caller that then stores another backup key, or removes the
 identity, leaves a second ciphertext of that name under the new key for the
 homeserver to serve. The `CreateStore` options write each name at most once.
 
+Filow's review of the change found two more needs. A device that holds or
+trusts another identity than the one Filow's wrap names (it missed a
+replacement, and the homeserver publishes the identity from before) must
+stop holding any backup key, for good: matrix-sdk serves a backup key it
+holds to any own device that identity signed, a revoked one included.
+Hence `forget_backup_key()`. And a rotation must record the key of the
+version it creates before the version exists, or a process stopped between
+the creation and the record leaves the current version's only copy
+unrecorded. Hence `create_with_key()`.
+
 Tests: `crates/matrix-sdk/tests/integration/encryption/secrets_from_memory.rs`
 (each import reads nothing from secret storage, a key of another identity or
 a malformed one imports nothing, a backup key that is not current is
 refused, a key served under the label of the version already enabled
-replaces the old one, each `CreateStore` option, and the unchanged
-defaults). In Filow,
+replaces the old one, each `CreateStore` option, the unchanged defaults, a
+forgotten backup key is neither held nor resumed, a version is created with
+the key given) and `test_backup_keys_forgetting` in matrix-sdk-crypto's
+store integration tests (memory and SQLite stores). In Filow,
 the #1685 tests in `client_core/src/key_backup/cross_signing_tests.rs` serve
 another ciphertext on every read after the first, and are red without the
-patch's use.
+patch's use; `a_device_trusting_another_identity_takes_up_no_backup_key` and
+`a_rotation_records_its_backup_key_before_creating_the_version` are red
+without the last two additions' use.
+
+## Patch 5: answer no secret request
+
+`crates/matrix-sdk-crypto/src/gossiping/machine.rs` and `Cargo.toml`: with
+the new feature `refuse-secret-requests`, `GossipMachine::handle_secret_request`
+serves no `m.secret.request`, whatever the requesting device and its trust.
+Off by default, so matrix-sdk-crypto's own behaviour and tests are
+unchanged; Filow's client core turns it on in its `matrix-sdk-crypto`
+dependency.
+
+### Why Filow needs it
+
+matrix-sdk-crypto serves a secret it holds (the backup decryption key, the
+private cross-signing keys) to any own device that is verified, and a
+device signed by the account's self-signing key is verified whatever its
+local trust (`handle_secret_request`; matrix-sdk-crypto 0.19 has no setting
+for it). The homeserver can forge such a request in a revoked device's
+name, and the answer, Olm-encrypted to that device's key, reaches it. A
+device that missed an identity replacement, or the device that made a
+rotation while the replacement is still owed, still trusts the identity a
+revoked device was signed by, so a revoked device could obtain the current
+backup key (Filow #1685, review finding H-1). Filow devices never need
+secret gossip: every secret they share travels through secret storage,
+opened with the account key. Upstream `main` (`33af1f68`, 2026-11-18) has
+no switch for it either: `handle_secret_request` still serves any verified
+own device.
+
+Tests: `test_secret_requests_are_refused` in `gossiping/machine.rs` (run
+with `--features refuse-secret-requests`), and `test_secret_share_cycle`,
+which serves the secret without the feature and refuses it with it. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_device`
+(`client_core/src/key_backup/gossip_tests.rs`) is red without the feature.
 
 ## Dependency bump: rusqlite 0.42.0
 

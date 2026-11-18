@@ -25,6 +25,9 @@ ignored = ["rustls-webpki", "rustls-pki-types"]
 [features]
 default = []
 automatic-room-key-forwarding = []
+# Filow patch 5: answer no `m.secret.request`, whoever asks. Filow devices
+# share secrets only through secret storage, opened with the account key.
+refuse-secret-requests = []
 experimental-send-custom-to-device = []
 
 # Enable experimental support for encrypting state events; see

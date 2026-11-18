@@ -402,6 +402,18 @@ impl GossipMachine {
             }
         };
 
+        // Filow patch 5: a client built with `refuse-secret-requests` serves no
+        // secret, whatever the requesting device and its trust.
+        if cfg!(feature = "refuse-secret-requests") {
+            info!(
+                sender = ?event.sender,
+                requesting_device_id = ?event.content.requesting_device_id,
+                ?secret_name,
+                "Not serving a secret request: this client answers none",
+            );
+            return Ok(None);
+        }
+
         let content = if let Some(secret) = self.inner.store.export_secret(secret_name).await? {
             SecretSendContent::new(event.content.request_id.to_owned(), secret)
         } else {
@@ -2100,7 +2112,66 @@ mod tests {
             let alice_cache = alice_machine.inner.store.cache().await.unwrap();
             alice_machine.collect_incoming_key_requests(&alice_cache).await.unwrap();
         }
-        assert!(!alice_machine.inner.outgoing_requests.read().is_empty());
+        // Filow patch 5: built with `refuse-secret-requests`, not even then.
+        assert_eq!(
+            alice_machine.inner.outgoing_requests.read().is_empty(),
+            cfg!(feature = "refuse-secret-requests")
+        );
+    }
+
+    // Filow patch 5: built with `refuse-secret-requests`, a verified own
+    // device holding an Olm session with us asks for a secret we hold, and
+    // is served nothing.
+    #[async_test]
+    #[cfg(feature = "refuse-secret-requests")]
+    async fn test_secret_requests_are_refused() {
+        let alice_machine = get_machine_test_helper().await;
+        let mut second_account = alice_2_account();
+        let alice_device = DeviceData::from_account(&second_account);
+        alice_device.set_trust_state(LocalTrust::Verified);
+        alice_machine
+            .inner
+            .store
+            .save_device_data(std::slice::from_ref(&alice_device))
+            .await
+            .unwrap();
+        let alice_session = alice_machine
+            .inner
+            .store
+            .with_transaction(async |tr| {
+                let alice_account = tr.account().await?;
+                let (alice_session, _) =
+                    alice_account.create_session_for_test_helper(&mut second_account).await;
+                Ok(alice_session)
+            })
+            .await
+            .unwrap();
+        alice_machine.inner.store.save_sessions(&[alice_session]).await.unwrap();
+        alice_machine.inner.store.reset_cross_signing_identity().await;
+
+        for name in [
+            SecretName::CrossSigningMasterKey,
+            SecretName::CrossSigningSelfSigningKey,
+            SecretName::CrossSigningUserSigningKey,
+            SecretName::RecoveryKey,
+        ] {
+            let event = RumaToDeviceEvent::new(
+                alice_id().to_owned(),
+                ToDeviceSecretRequestEventContent::new(
+                    RequestAction::Request(SecretRequestAction::new(name.clone())),
+                    second_account.device_id().into(),
+                    format!("request-{name}").into(),
+                ),
+            );
+            alice_machine.receive_incoming_secret_request(&event);
+            let alice_cache = alice_machine.inner.store.cache().await.unwrap();
+            alice_machine.collect_incoming_key_requests(&alice_cache).await.unwrap();
+
+            assert!(
+                alice_machine.inner.outgoing_requests.read().is_empty(),
+                "served {name} to a verified own device"
+            );
+        }
     }
 
     #[async_test]
