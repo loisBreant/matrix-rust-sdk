@@ -811,8 +811,9 @@ impl Backups {
     /// enabled for the current version counts only when it uses this very
     /// key and the homeserver serves this key's public half for that version.
     /// Otherwise this key replaces the stored one if it is the current
-    /// version's, or [`EnableBackupError::InconsistentBackupDecryptionKey`] is
-    /// returned.
+    /// version's; if not, a backup this device runs with another key is
+    /// disabled (locally) and
+    /// [`EnableBackupError::InconsistentBackupDecryptionKey`] is returned.
     ///
     /// Filow patch 4: the version is a label the homeserver chooses. A
     /// homeserver serving a new backup version's public key under the label of
@@ -864,12 +865,12 @@ impl Backups {
 
             // Filow patch 4: with `exact_key`, the stored key must be this one,
             // and this one the version's.
-            let same_key = !exact_key
-                || (decryption_key.backup_key_matches(&backup_info)
-                    && stored_keys.decryption_key.as_ref().is_some_and(|stored| {
-                        stored.megolm_v1_public_key().to_base64()
-                            == decryption_key.megolm_v1_public_key().to_base64()
-                    }));
+            let stored_is_given = stored_keys.decryption_key.as_ref().is_some_and(|stored| {
+                stored.megolm_v1_public_key().to_base64()
+                    == decryption_key.megolm_v1_public_key().to_base64()
+            });
+            let same_key =
+                !exact_key || (decryption_key.backup_key_matches(&backup_info) && stored_is_given);
 
             if stored_keys.backup_version.as_ref() == Some(&current_version.version)
                 && self.are_enabled().await
@@ -935,6 +936,15 @@ impl Backups {
                     "Found an active backup but the recovery key we received isn't the one used for \
                      this backup version"
                 );
+
+                // Filow patch 4: the key given is the one the caller trusts,
+                // and the current version is not its. A device backing up
+                // with another key stops, rather than keep encrypting room
+                // keys to a key the homeserver chose to make current again.
+                if exact_key && !stored_is_given && self.are_enabled().await {
+                    warn!("Disabling the backup this device uses: its key is not the one given");
+                    backup_machine.disable_backup().await?;
+                }
 
                 Err(EnableBackupError::InconsistentBackupDecryptionKey)
             }
