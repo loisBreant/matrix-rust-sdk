@@ -30,7 +30,8 @@ use std::{
 
 use ruma::{
     DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedRoomId, OwnedTransactionId, RoomId,
-    TransactionId, api::client::backup::RoomKeyBackup, serde::Raw,
+    TransactionId, api::client::backup::RoomKeyBackup, events::secret::request::SecretName,
+    serde::Raw,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
@@ -438,14 +439,18 @@ impl BackupMachine {
     }
 
     /// Remove the backup decryption key and backup version from the crypto
-    /// store, so nothing resumes them at the next start.
+    /// store, and any backup key waiting in the secret inbox, so nothing
+    /// resumes a backup at the next start.
     ///
     /// Filow patch 4: [`BackupMachine::save_decryption_key`] cannot remove
     /// them (`None` leaves the stored values as they are), and
-    /// [`BackupMachine::disable_backup`] only stops the backup in memory.
+    /// [`BackupMachine::disable_backup`] only stops the backup in memory. A
+    /// backup key in the inbox would be enabled at the next start once no
+    /// key is stored, after checking only the homeserver's current version.
     pub async fn forget_decryption_key(&self) -> Result<(), CryptoStoreError> {
         let changes = Changes { forget_backup_keys: true, ..Default::default() };
-        self.store.save_changes(changes).await
+        self.store.save_changes(changes).await?;
+        self.store.delete_secrets_from_inbox(&SecretName::RecoveryKey).await
     }
 
     /// Get the backup keys we have saved in our crypto store.
@@ -649,7 +654,10 @@ mod tests {
 
     use assert_matches2::assert_let;
     use matrix_sdk_test::async_test;
-    use ruma::{CanonicalJsonValue, DeviceId, RoomId, UserId, device_id, room_id, user_id};
+    use ruma::{
+        CanonicalJsonValue, DeviceId, RoomId, UserId, device_id,
+        events::secret::request::SecretName, room_id, user_id,
+    };
     use serde_json::json;
 
     use super::BackupMachine;
@@ -658,7 +666,7 @@ mod tests {
         olm::BackedUpRoomKey,
         store::{
             CryptoStore, MemoryStore,
-            types::{BackupDecryptionKey, Changes},
+            types::{BackupDecryptionKey, Changes, SecretsInboxItem},
         },
         types::RoomKeyBackupInfo,
     };
@@ -756,6 +764,44 @@ mod tests {
 
     async fn current_backup_version(backup_machine: &BackupMachine) -> Option<String> {
         backup_machine.backup_key.read().await.as_ref().and_then(|k| k.backup_version())
+    }
+
+    // Filow patch 4: forgetting the backup key removes the stored key and
+    // version and any backup key waiting in the secret inbox.
+    #[async_test]
+    async fn test_forgetting_the_backup_key_empties_the_store_and_the_inbox() {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        machine
+            .store()
+            .save_changes(Changes {
+                backup_decryption_key: Some(BackupDecryptionKey::new()),
+                backup_version: Some("1".to_owned()),
+                secrets: vec![SecretsInboxItem {
+                    secret_name: SecretName::RecoveryKey,
+                    secret: BackupDecryptionKey::new().to_base64().into(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.store().get_secrets_from_inbox(&SecretName::RecoveryKey).await.unwrap().len(),
+            1
+        );
+
+        machine.backup_machine().forget_decryption_key().await.unwrap();
+
+        let keys = machine.backup_machine().get_backup_keys().await.unwrap();
+        assert!(keys.decryption_key.is_none());
+        assert!(keys.backup_version.is_none());
+        assert!(
+            machine
+                .store()
+                .get_secrets_from_inbox(&SecretName::RecoveryKey)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[async_test]
