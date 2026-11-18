@@ -336,7 +336,12 @@ impl SecretStorage {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn create_secret_store(&self) -> CreateStore<'_> {
-        CreateStore { secret_storage: self, passphrase: None }
+        CreateStore {
+            secret_storage: self,
+            passphrase: None,
+            backup_key: None,
+            export_cross_signing_keys: true,
+        }
     }
 
     /// Run a network request to find if secret storage is set up for this user.

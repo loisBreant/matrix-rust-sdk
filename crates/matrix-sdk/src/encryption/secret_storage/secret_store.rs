@@ -14,7 +14,9 @@
 
 use std::fmt;
 
-use matrix_sdk_base::crypto::{CrossSigningKeyExport, secret_storage::SecretStorageKey};
+use matrix_sdk_base::crypto::{
+    CrossSigningKeyExport, CrossSigningStatus, secret_storage::SecretStorageKey,
+};
 use ruma::{
     events::{
         GlobalAccountDataEventType, secret::request::SecretName,
@@ -314,28 +316,9 @@ impl SecretStore {
     async fn maybe_enable_backups(&self) -> Result<()> {
         match self.get_secret(SecretName::RecoveryKey).await {
             Ok(Some(mut secret)) => {
-                let ret = self
-                    .client
-                    .encryption()
-                    .backups()
-                    .maybe_enable_backups(&secret)
-                    .await
-                    .map_err(|e| match e {
-                        EnableBackupError::InconsistentBackupDecryptionKey => {
-                            SecretStorageError::InconsistentBackupDecryptionKey
-                        }
-                        EnableBackupError::Error(error) => {
-                            SecretStorageError::into_import_error(SecretName::RecoveryKey, error)
-                        }
-                    });
-
-                if let Err(e) = &ret {
-                    warn!("Could not enable backups from secret storage: {e:?}");
-                }
-
+                let ret = self.import_backup_key(&secret).await;
                 secret.zeroize();
-
-                Ok(ret.map(|_| ())?)
+                ret
             }
             Err(e) => {
                 warn!("Could not enable backups from secret storage: {e:?}");
@@ -347,6 +330,46 @@ impl SecretStore {
                 Ok(())
             }
         }
+    }
+
+    /// Enable key backups with a backup decryption key the caller already
+    /// holds in memory, typically one it read with
+    /// [`SecretStore::get_secret()`] and checked.
+    ///
+    /// This is the second half of [`SecretStore::import_secrets()`]'s backup
+    /// step, without reading `m.megolm_backup.v1` from the homeserver again:
+    /// the key is used only if it matches the public key of the backup
+    /// version the homeserver serves as current, and nothing changes when
+    /// backups are already enabled for that version.
+    ///
+    /// Filow patch 4: reading a secret once and importing that same value
+    /// closes the gap between a caller's own check of the secret and
+    /// `import_secrets()`'s second read, which a homeserver can answer with
+    /// another ciphertext stored under the same secret-storage key.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretStorageError::InconsistentBackupDecryptionKey`] when the key is
+    /// not the current backup version's, and
+    /// [`SecretStorageError::ImportError`] for any other failure.
+    pub async fn import_backup_key(&self, backup_key: &str) -> Result<()> {
+        let ret =
+            self.client.encryption().backups().maybe_enable_backups(backup_key).await.map_err(
+                |e| match e {
+                    EnableBackupError::InconsistentBackupDecryptionKey => {
+                        SecretStorageError::InconsistentBackupDecryptionKey
+                    }
+                    EnableBackupError::Error(error) => {
+                        SecretStorageError::into_import_error(SecretName::RecoveryKey, error)
+                    }
+                },
+            );
+
+        if let Err(e) = &ret {
+            warn!("Could not enable backups from secret storage: {e:?}");
+        }
+
+        ret.map(|_| ())
     }
 
     /// Retrieve and store well-known secrets locally
@@ -399,7 +422,7 @@ impl SecretStore {
     /// ```
     ///
     /// [`Device`]: crate::encryption::identities::Device
-    #[instrument(fields(user_id, device_id, cross_signing_status))]
+    #[instrument(fields(user_id, device_id))]
     pub async fn import_secrets(&self) -> Result<()> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
@@ -414,6 +437,46 @@ impl SecretStore {
         let export = self.get_cross_signing_keys().await?;
 
         info!(cross_signing_keys = ?export, "Received the cross signing keys from the server");
+
+        self.import_cross_signing_keys(export).await?;
+
+        self.maybe_enable_backups().await?;
+
+        Ok(())
+    }
+
+    /// Import private cross-signing keys the caller already holds in memory,
+    /// typically ones it read with [`SecretStore::get_secret()`] and checked.
+    ///
+    /// This is the cross-signing step of [`SecretStore::import_secrets()`]
+    /// without reading the keys from the homeserver again: the public
+    /// identity is refreshed with a `/keys/query`, each given private key is
+    /// imported only if it matches the published public key of the same
+    /// usage (nothing is imported if one does not), and, when the
+    /// self-signing key was imported, this device is signed with it.
+    ///
+    /// Filow patch 4: reading a secret once and importing that same value
+    /// closes the gap between a caller's own check of the secret and
+    /// `import_secrets()`'s second read, which a homeserver can answer with
+    /// another ciphertext stored under the same secret-storage key.
+    ///
+    /// Returns which private cross-signing keys this device holds afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretStorageError::ImportError`] naming the key that is malformed
+    /// or does not match the published identity.
+    #[instrument(skip_all, fields(user_id, device_id, cross_signing_status))]
+    pub async fn import_cross_signing_keys(
+        &self,
+        export: CrossSigningKeyExport,
+    ) -> Result<CrossSigningStatus> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+
+        Span::current()
+            .record("user_id", display(olm_machine.user_id()))
+            .record("device_id", display(olm_machine.device_id()));
 
         // We need to ensure that we have the public parts of the cross-signing keys,
         // those are represented as the `OwnUserIdentity` struct. The public
@@ -455,9 +518,7 @@ impl SecretStore {
             }
         }
 
-        self.maybe_enable_backups().await?;
-
-        Ok(())
+        Ok(status)
     }
 
     /// Upload well-known secrets to the server
@@ -476,12 +537,34 @@ impl SecretStore {
     /// of the necessary secrets for device and identity verification and key
     /// storage (if enabled).
     pub async fn export_secrets(&self) -> Result<()> {
+        self.export_cross_signing_keys().await?;
+        self.export_backup_key().await
+    }
+
+    /// Upload the private cross-signing keys this device holds, and nothing
+    /// else: [`SecretStore::export_secrets()`] without the backup recovery
+    /// key.
+    ///
+    /// Filow patch 4: a caller that stores the identity again under a
+    /// secret-storage key must not also write this device's own backup key
+    /// there, which may differ from the one stored under that key already
+    /// (a second ciphertext of `m.megolm_backup.v1` the homeserver can then
+    /// serve instead of the first).
+    pub async fn export_cross_signing_keys(&self) -> Result<()> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
 
         if let Some(cross_signing_keys) = olm_machine.export_cross_signing_keys().await? {
             self.put_cross_signing_keys(cross_signing_keys).await?;
         }
+
+        Ok(())
+    }
+
+    /// Upload this device's backup recovery key, if it holds one.
+    pub(super) async fn export_backup_key(&self) -> Result<()> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
 
         let backup_keys = olm_machine.backup_machine().get_backup_keys().await?;
 

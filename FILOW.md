@@ -8,7 +8,8 @@ here and a new pin there.
 
 Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
 https://github.com/loisBreant/Filow/issues/537 (patch 2),
-https://github.com/loisBreant/Filow/issues/1560 (patch 3)
+https://github.com/loisBreant/Filow/issues/1560 (patch 3),
+https://github.com/loisBreant/Filow/issues/1685 (patch 4)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -145,6 +146,62 @@ room is marked, never encrypt the next event. In Filow,
 `a_member_landed_between_the_check_and_the_share_gets_no_ai_room_key`
 (`client_core/src/matrix/send.rs`) is red without the patch (the bot landed
 mid-send gets the room key) and green with it.
+
+## Patch 4: import secrets from memory, and write each secret once
+
+`crates/matrix-sdk/src/encryption/secret_storage/secret_store.rs`,
+`futures.rs` and `mod.rs`, all additive:
+
+- `SecretStore::import_cross_signing_keys(CrossSigningKeyExport)`: the
+  cross-signing step of `import_secrets()` on keys the caller already holds.
+  It refreshes the own identity with a `/keys/query`, imports through the
+  checked `OlmMachine::import_cross_signing_keys` (each key must match the
+  published one of its usage, or none is imported), signs the own device when
+  the self-signing key came in, and returns the `CrossSigningStatus`.
+- `SecretStore::import_backup_key(&str)`: the backup step of
+  `import_secrets()` on a key the caller already holds
+  (`Backups::maybe_enable_backups`, same error mapping:
+  `InconsistentBackupDecryptionKey` when the key is not the current
+  version's).
+- `import_secrets()` now reads the secrets, then calls those two; its
+  behaviour is unchanged (`secret_storage.rs`'s
+  `test_restore_cross_signing_from_secret_store` still pins it).
+- `SecretStore::export_cross_signing_keys()`: `export_secrets()` without the
+  backup key. `export_secrets()` is that plus the backup key, as before.
+- `CreateStore::with_backup_key(&str)` stores the given backup key instead
+  of the device's own, and `CreateStore::without_cross_signing_keys()`
+  stores no private cross-signing key. Without either, `create_secret_store()`
+  exports what it exported before.
+
+### Why Filow needs it
+
+Filow checks secret storage against its key-backup wrap (the identity and
+the backup key the wrap names) before restoring, then needs to import what
+it checked. `import_secrets()` reads every secret from the homeserver again,
+one GET each, and a homeserver can answer that second read with another
+ciphertext it kept under the same secret-storage key: a previous identity it
+publishes again, or a backup key a revoked device knew whose version it makes
+current again (Filow #1685, found in review of Filow #1638). Upstream exposes
+no import from memory: `get_cross_signing_keys` and `maybe_enable_backups`
+are private, `Backups::maybe_enable_backups` is `pub(crate)`, the checked
+`OlmMachine::import_cross_signing_keys` is reachable only through
+`olm_machine_for_testing`, and `Encryption::import_secrets_bundle` imports
+unchecked and needs every key (upstream `main` at `2c76c145`, 2026-11-17,
+unchanged).
+
+Moving secret storage to a new key has the same weakness in the other
+direction: `Recovery::reset_key()` exports the device's own backup key and
+identity, and a caller that then stores another backup key, or removes the
+identity, leaves a second ciphertext of that name under the new key for the
+homeserver to serve. The `CreateStore` options write each name at most once.
+
+Tests: `crates/matrix-sdk/tests/integration/encryption/secrets_from_memory.rs`
+(each import reads nothing from secret storage, a key of another identity or
+a malformed one imports nothing, a backup key that is not current is
+refused, each `CreateStore` option, and the unchanged defaults). In Filow,
+the #1685 tests in `client_core/src/key_backup/cross_signing_tests.rs` serve
+another ciphertext on every read after the first, and are red without the
+patch's use.
 
 ## Dependency bump: rusqlite 0.42.0
 

@@ -4,6 +4,7 @@ mod dehydrated_devices;
 mod own_user_only_room_keys;
 mod recovery;
 mod secret_storage;
+mod secrets_from_memory;
 mod shared_history;
 #[cfg(feature = "experimental-encrypted-state-events")]
 mod state_events;
