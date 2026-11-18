@@ -468,3 +468,24 @@ async fn test_the_stored_backup_public_key_is_the_one_imported() {
         Some(backup.megolm_v1_public_key().to_base64())
     );
 }
+
+// A device backing up with a key it no longer trusts takes the one given,
+// and keeps it across a restart (the stored key is what resumes).
+#[async_test]
+async fn test_an_adopted_backup_key_replaces_the_stored_one() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, old) = first_device_with_backup(&server).await;
+    let given = BackupDecryptionKey::new();
+
+    first.encryption().backups().adopt_backup_key(&given.to_base64()).await.unwrap();
+
+    assert!(first.encryption().backups().are_enabled().await);
+    let stored = stored_backup_key(&first).await;
+    assert_eq!(stored, Some(given.megolm_v1_public_key().to_base64()));
+    assert_ne!(stored, Some(old.megolm_v1_public_key().to_base64()));
+    let olm = first.olm_machine_for_testing().await;
+    let keys = olm.as_ref().unwrap().backup_machine().get_backup_keys().await.unwrap();
+    assert_eq!(keys.backup_version.as_deref(), Some("1"), "the stored version changed");
+}

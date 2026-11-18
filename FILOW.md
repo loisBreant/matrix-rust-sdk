@@ -174,6 +174,12 @@ mid-send gets the room key) and green with it.
 - `Backups::stored_backup_public_key()`: the public half of the backup
   decryption key the device stores, so a caller can tell whether the device
   backs up with another key than the one it trusts.
+- `Backups::adopt_backup_key(&str)`: store and back up with the given key,
+  under the version the device stores, whatever the homeserver serves as
+  current; room keys are marked not backed up, so they are all encrypted to
+  it from then on. A persistent fail-closed for a device backing up with a
+  key the caller no longer trusts and cannot rotate off: disabling does not
+  last, since matrix-sdk resumes the stored key at start.
 - `SecretStore::export_cross_signing_keys()`: `export_secrets()` without the
   backup key. `export_secrets()` is that plus the backup key, as before.
 - `CreateStore::with_backup_key(&str)` stores the given backup key instead

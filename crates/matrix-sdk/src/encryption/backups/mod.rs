@@ -406,6 +406,47 @@ impl Backups {
         Ok(keys.decryption_key.map(|key| key.megolm_v1_public_key().to_base64()))
     }
 
+    /// Make `backup_key` (unpadded base64) the backup decryption key this
+    /// device stores and backs up with, under the backup version it stores,
+    /// whatever the homeserver serves as current. Room keys are marked not
+    /// backed up, so they are all encrypted to `backup_key` from now on. With
+    /// no stored version, the key is stored and nothing is backed up until a
+    /// version is enabled.
+    ///
+    /// Filow patch 4: a fail-closed for a device that backs up with a key
+    /// the caller no longer trusts (one a revoked device knew, which the
+    /// homeserver made current again) and cannot rotate off it. Disabling
+    /// would not last: the stored key is resumed at the next start.
+    pub async fn adopt_backup_key(&self, backup_key: &str) -> Result<(), Error> {
+        let _guard = self.client.locks().backup_modify_lock.lock().await;
+
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let backup_machine = olm_machine.backup_machine();
+
+        let decryption_key = BackupDecryptionKey::from_base64(backup_key).map_err(|e| {
+            <serde_json::Error as serde::de::Error>::custom(format!(
+                "Couldn't deserialize the backup recovery key: {e:?}"
+            ))
+        })?;
+        let version = backup_machine.get_backup_keys().await?.backup_version;
+
+        backup_machine.disable_backup().await?;
+        backup_machine.save_decryption_key(Some(decryption_key.clone()), version.clone()).await?;
+
+        if let Some(version) = version {
+            let public_key = decryption_key.megolm_v1_public_key();
+            public_key.set_version(version);
+            backup_machine.enable_backup_v1(public_key).await?;
+            self.set_state(BackupState::Enabled);
+            self.maybe_trigger_backup();
+        } else {
+            self.set_state(BackupState::Unknown);
+        }
+
+        Ok(())
+    }
+
     /// Are backups enabled for the current [`Client`]?
     ///
     /// This method will check if we locally have an active backup key and
