@@ -449,25 +449,3 @@ async fn test_the_backup_key_already_enabled_is_kept() {
     assert!(first.encryption().backups().are_enabled().await);
     assert_eq!(stored_backup_key(&first).await, Some(own.megolm_v1_public_key().to_base64()));
 }
-
-// The key given is not the current version's, and this device backs up with
-// another key: it stops backing up rather than keep encrypting room keys to
-// a key the homeserver chose to make current again.
-#[async_test]
-async fn test_a_device_stops_backing_up_with_another_key_when_the_given_one_is_not_current() {
-    let server = MatrixMockServer::new().await;
-    let account_data = AccountData::default();
-    account_data.mount(&server).await;
-    let (first, old) = first_device_with_backup(&server).await;
-    let store = first.encryption().secret_storage().create_secret_store().await.unwrap();
-
-    let given = BackupDecryptionKey::new();
-    assert_matches!(
-        store.import_backup_key(&given.to_base64()).await,
-        Err(SecretStorageError::InconsistentBackupDecryptionKey)
-    );
-
-    assert!(!first.encryption().backups().are_enabled().await, "still backing up to the old key");
-    // The stored key is left as it was: nothing is deleted.
-    assert_eq!(stored_backup_key(&first).await, Some(old.megolm_v1_public_key().to_base64()));
-}

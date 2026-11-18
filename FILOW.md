@@ -166,11 +166,7 @@ mid-send gets the room key) and green with it.
   (`Backups::enable_backups_with_key`); otherwise this key replaces it. The
   version is a label the homeserver chooses, and serving a new key under the
   label a device already backs up to would otherwise keep the device
-  encrypting room keys to its old key. And when the key given is not the
-  current version's, a backup the device runs with another key is disabled
-  (locally, nothing deleted) before `InconsistentBackupDecryptionKey`: a
-  homeserver making a retired version current again would otherwise keep
-  the device backing up to the retired key. `maybe_enable_backups`, which
+  encrypting room keys to its old key. `maybe_enable_backups`, which
   `import_secrets()` uses, is unchanged.
 - `import_secrets()` now reads the secrets, then calls those two; its
   behaviour is unchanged (`secret_storage.rs`'s
