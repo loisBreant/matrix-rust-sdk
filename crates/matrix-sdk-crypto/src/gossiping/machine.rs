@@ -868,11 +868,19 @@ impl GossipMachine {
     }
 
     /// Create outgoing secret requests for the given
+    ///
+    /// Filow patch 5: a client built with `refuse-secret-requests` asks for no
+    /// secret either (none after an own-device verification, none from
+    /// `query_missing_secrets_from_other_sessions`), so nothing it did not
+    /// ask for can reach its secret inbox.
     pub fn request_missing_secrets(
         own_user_id: &UserId,
         secret_names: Vec<SecretName>,
     ) -> Vec<GossipRequest> {
-        if !secret_names.is_empty() {
+        if cfg!(feature = "refuse-secret-requests") {
+            info!(?secret_names, "Not requesting secrets: this client asks for none");
+            vec![]
+        } else if !secret_names.is_empty() {
             info!(?secret_names, "Creating new outgoing secret requests");
 
             secret_names
@@ -1245,19 +1253,11 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::GossipMachine;
+    // Filow patch 5: used only by tests the feature leaves out.
+    #[cfg_attr(feature = "refuse-secret-requests", allow(unused_imports))]
     use crate::{
         DecryptionSettings, TrustRequirement,
-        identities::{DeviceData, IdentityManager, LocalTrust},
-        olm::{Account, PrivateCrossSigningIdentity},
-        session_manager::GroupSessionCache,
-        store::{
-            CryptoStoreWrapper, MemoryStore, Store,
-            types::{Changes, PendingChanges},
-        },
-        types::events::room::encrypted::{
-            EncryptedEvent, EncryptedToDeviceEvent, RoomEncryptedEventContent,
-        },
-        verification::VerificationMachine,
+        types::events::room::encrypted::EncryptedToDeviceEvent,
     };
     #[cfg(feature = "automatic-room-key-forwarding")]
     use crate::{
@@ -1273,6 +1273,17 @@ mod tests {
                 olm_v1::DecryptedOlmV1Event,
             },
         },
+    };
+    use crate::{
+        identities::{DeviceData, IdentityManager, LocalTrust},
+        olm::{Account, PrivateCrossSigningIdentity},
+        session_manager::GroupSessionCache,
+        store::{
+            CryptoStoreWrapper, MemoryStore, Store,
+            types::{Changes, PendingChanges},
+        },
+        types::events::room::encrypted::{EncryptedEvent, RoomEncryptedEventContent},
+        verification::VerificationMachine,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1469,6 +1480,7 @@ mod tests {
         (alice_machine, group_session, bob_machine)
     }
 
+    #[cfg_attr(feature = "refuse-secret-requests", allow(dead_code))]
     fn extract_content<'a>(
         recipient: &UserId,
         request: &'a crate::types::requests::OutgoingRequest,
@@ -1503,6 +1515,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(feature = "refuse-secret-requests", allow(dead_code))]
     fn request_to_event<C>(
         recipient: &UserId,
         sender: &UserId,
@@ -2120,8 +2133,9 @@ mod tests {
     }
 
     // Filow patch 5: built with `refuse-secret-requests`, a verified own
-    // device holding an Olm session with us asks for a secret we hold, and
-    // is served nothing.
+    // device holding an Olm session with us asks for each secret we hold
+    // (the identity's three private keys and a backup key), and is served
+    // nothing.
     #[async_test]
     #[cfg(feature = "refuse-secret-requests")]
     async fn test_secret_requests_are_refused() {
@@ -2148,6 +2162,15 @@ mod tests {
             .unwrap();
         alice_machine.inner.store.save_sessions(&[alice_session]).await.unwrap();
         alice_machine.inner.store.reset_cross_signing_identity().await;
+        alice_machine
+            .inner
+            .store
+            .save_changes(Changes {
+                backup_decryption_key: Some(crate::store::types::BackupDecryptionKey::new()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         for name in [
             SecretName::CrossSigningMasterKey,
@@ -2163,6 +2186,10 @@ mod tests {
                     format!("request-{name}").into(),
                 ),
             );
+            assert!(
+                alice_machine.inner.store.export_secret(&name).await.unwrap().is_some(),
+                "the fixture holds no {name}"
+            );
             alice_machine.receive_incoming_secret_request(&event);
             let alice_cache = alice_machine.inner.store.cache().await.unwrap();
             alice_machine.collect_incoming_key_requests(&alice_cache).await.unwrap();
@@ -2175,6 +2202,8 @@ mod tests {
     }
 
     #[async_test]
+    // Filow patch 5: the request this test makes is not made with the feature.
+    #[cfg(not(feature = "refuse-secret-requests"))]
     async fn test_secret_broadcasting() {
         use futures_util::{FutureExt, pin_mut};
         use ruma::api::client::to_device::send_event_to_device::v3::Response as ToDeviceResponse;

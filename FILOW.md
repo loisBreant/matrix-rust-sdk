@@ -185,16 +185,18 @@ mid-send gets the room key) and green with it.
   means the caller's next check adopts the key again; nothing is lost and
   nothing reaches a key the caller did not give.
 - `Backups::forget_backup_key()`: stop backing up, and remove the backup
-  decryption key and version the device stores, leaving the homeserver's
-  versions alone (and the secret inbox, which holds only secrets the device
-  asked for; Filow asks for none). Nothing is
+  decryption key and version the device stores, and any backup key waiting
+  in its secret inbox (with no key stored, `maybe_resume_backups` would
+  enable one from the inbox at the next start, after checking only the
+  homeserver's current version), leaving the homeserver's versions alone. Nothing is
   resumed at the next start, and the device holds no backup key a device
   asking for it could be served. `Backups::disable()` deletes the version on
   the homeserver and leaves the key stored; `save_decryption_key(None,
   None)` changes nothing (`None` means "unchanged"). Underneath:
   `Changes::forget_backup_keys` in matrix-sdk-crypto, applied before a key
   or version saved in the same changes, by the memory, SQLite and IndexedDB
-  stores, and `BackupMachine::forget_decryption_key()`.
+  stores, and `BackupMachine::forget_decryption_key()`, which also empties
+  the inbox's backup key.
 - `Backups::create_with_key(&str)`: `Backups::create()` with a backup
   decryption key the caller chose, so it can record the key before the
   homeserver hears of the version. With `create()` the key is known only
@@ -244,8 +246,10 @@ a malformed one imports nothing, a backup key that is not current is
 refused, a key served under the label of the version already enabled
 replaces the old one, each `CreateStore` option, the unchanged defaults, a
 forgotten backup key is neither held nor resumed, a version is created with
-the key given) and `test_backup_keys_forgetting` in matrix-sdk-crypto's
-store integration tests (memory and SQLite stores). In Filow,
+the key given), `test_backup_keys_forgetting` in matrix-sdk-crypto's
+store integration tests (memory and SQLite stores) and
+`test_forgetting_the_backup_key_empties_the_store_and_the_inbox`
+(`backups/mod.rs`). In Filow,
 the #1685 tests in `client_core/src/key_backup/cross_signing_tests.rs` serve
 another ciphertext on every read after the first, and are red without the
 patch's use; `a_device_trusting_another_identity_takes_up_no_backup_key` and
@@ -256,7 +260,11 @@ without the last two additions' use.
 
 `crates/matrix-sdk-crypto/src/gossiping/machine.rs` and `Cargo.toml`: with
 the new feature `refuse-secret-requests`, `GossipMachine::handle_secret_request`
-serves no `m.secret.request`, whatever the requesting device and its trust.
+serves no `m.secret.request`, whatever the requesting device and its trust,
+and `GossipMachine::request_missing_secrets` makes none, so the device asks
+for no secret after an own-device verification or from
+`OlmMachine::query_missing_secrets_from_other_sessions`, and nothing it did
+not ask for is taken into its secret inbox.
 Off by default, so matrix-sdk-crypto's own behaviour and tests are
 unchanged; Filow's client core turns it on in its `matrix-sdk-crypto`
 dependency.
@@ -279,8 +287,14 @@ no switch for it either: `handle_secret_request` still serves any verified
 own device.
 
 Tests: `test_secret_requests_are_refused` in `gossiping/machine.rs` (run
-with `--features refuse-secret-requests`), and `test_secret_share_cycle`,
-which serves the secret without the feature and refuses it with it. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_device`
+with `--features refuse-secret-requests`; the fixture holds the three
+cross-signing keys and a backup key), `test_secret_share_cycle`, which
+serves the secret without the feature and refuses it with it, and
+`test_request_missing_secrets` and `test_request_missing_secrets_cross_signed`
+in `machine/tests/mod.rs`, which make requests without the feature and none
+with it (`test_secret_broadcasting`, whose request the feature does not
+make, runs without it only). The whole matrix-sdk-crypto library suite
+passes both ways. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_device`
 (`client_core/src/key_backup/gossip_tests.rs`) is red without the feature.
 
 ## Dependency bump: rusqlite 0.42.0

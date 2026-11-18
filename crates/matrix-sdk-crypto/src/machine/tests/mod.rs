@@ -725,7 +725,8 @@ async fn test_request_missing_secrets() {
 
     let should_query_secrets = alice.query_missing_secrets_from_other_sessions().await.unwrap();
 
-    assert!(should_query_secrets);
+    // Filow patch 5: with `refuse-secret-requests` no secret is asked for.
+    assert_eq!(should_query_secrets, !cfg!(feature = "refuse-secret-requests"));
 
     let outgoing_to_device = alice
         .outgoing_requests()
@@ -740,7 +741,10 @@ async fn test_request_missing_secrets() {
         })
         .collect_vec();
 
-    assert_eq!(outgoing_to_device.len(), 4);
+    assert_eq!(
+        outgoing_to_device.len(),
+        if cfg!(feature = "refuse-secret-requests") { 0 } else { 4 }
+    );
 
     // The second time, as there are already in-flight requests, it should have no
     // effect.
@@ -756,7 +760,8 @@ async fn test_request_missing_secrets_cross_signed() {
 
     let should_query_secrets = alice.query_missing_secrets_from_other_sessions().await.unwrap();
 
-    assert!(should_query_secrets);
+    // Filow patch 5: with `refuse-secret-requests` no secret is asked for.
+    assert_eq!(should_query_secrets, !cfg!(feature = "refuse-secret-requests"));
 
     let outgoing_to_device = alice
         .outgoing_requests()
@@ -770,7 +775,10 @@ async fn test_request_missing_secrets_cross_signed() {
             _ => false,
         })
         .collect_vec();
-    assert_eq!(outgoing_to_device.len(), 1);
+    assert_eq!(
+        outgoing_to_device.len(),
+        if cfg!(feature = "refuse-secret-requests") { 0 } else { 1 }
+    );
 
     // The second time, as there are already in-flight requests, it should have no
     // effect.
