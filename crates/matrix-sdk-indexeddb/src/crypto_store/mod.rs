@@ -601,6 +601,13 @@ impl IndexeddbCryptoStore {
             );
         }
 
+        // Filow patch 4: removed first, so a key saved with the removal stays.
+        if changes.forget_backup_keys {
+            let mut backup_keys = indexeddb_changes.get(keys::BACKUP_KEYS);
+            backup_keys.delete(JsValue::from_str(keys::RECOVERY_KEY_V1));
+            backup_keys.delete(JsValue::from_str(keys::BACKUP_VERSION_V1));
+        }
+
         if let Some(a) = &decryption_key_pickle {
             indexeddb_changes.get(keys::BACKUP_KEYS).put(
                 JsValue::from_str(keys::RECOVERY_KEY_V1),

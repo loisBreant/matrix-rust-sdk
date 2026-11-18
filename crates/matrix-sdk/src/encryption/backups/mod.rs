@@ -95,6 +95,30 @@ impl Backups {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn create(&self) -> Result<(), Error> {
+        self.create_with_decryption_key(BackupDecryptionKey::new()).await
+    }
+
+    /// [`Backups::create()`], with `backup_key` (unpadded base64) as the new
+    /// version's backup decryption key instead of one generated here.
+    ///
+    /// Filow patch 4: a caller that records the key of the version it is
+    /// about to create, before the homeserver hears of it, chooses the key
+    /// first. With [`Backups::create()`] the key is known only once the
+    /// version exists and the device stores it: a process stopped in between
+    /// leaves the device backing up with a key the caller never recorded.
+    pub async fn create_with_key(&self, backup_key: &str) -> Result<(), Error> {
+        let decryption_key = BackupDecryptionKey::from_base64(backup_key).map_err(|e| {
+            <serde_json::Error as serde::de::Error>::custom(format!(
+                "Couldn't deserialize the backup recovery key: {e:?}"
+            ))
+        })?;
+        self.create_with_decryption_key(decryption_key).await
+    }
+
+    async fn create_with_decryption_key(
+        &self,
+        decryption_key: BackupDecryptionKey,
+    ) -> Result<(), Error> {
         self.client.inner.e2ee.backup_state.clear_backup_exists_on_server();
         let _guard = self.client.locks().backup_modify_lock.lock().await;
 
@@ -105,9 +129,6 @@ impl Backups {
         let future = async {
             let olm_machine = self.client.olm_machine().await;
             let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
-
-            // Create a new backup recovery key.
-            let decryption_key = BackupDecryptionKey::new();
 
             // Get the info about the new backup key, this needs to be uploaded to the
             // homeserver[1].
@@ -443,6 +464,32 @@ impl Backups {
         } else {
             self.set_state(BackupState::Unknown);
         }
+
+        Ok(())
+    }
+
+    /// Stop backing up, and forget the backup decryption key and version this
+    /// device stores: nothing resumes a backup at the next start from them,
+    /// and the device no longer holds a backup key to serve to a device that
+    /// asks for it. The homeserver's backup versions are left as they are,
+    /// and so is the secret inbox (it holds only secrets this device asked
+    /// for).
+    ///
+    /// Filow patch 4: [`Backups::disable()`] deletes the version on the
+    /// homeserver and leaves the key stored, which is resumed at the next
+    /// start. A device that must stop holding a backup key it may no longer
+    /// trust, and must not delete a version other devices back up to, has no
+    /// other way.
+    pub async fn forget_backup_key(&self) -> Result<(), Error> {
+        let _guard = self.client.locks().backup_modify_lock.lock().await;
+
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let backup_machine = olm_machine.backup_machine();
+
+        backup_machine.disable_backup().await?;
+        backup_machine.forget_decryption_key().await?;
+        self.set_state(BackupState::Unknown);
 
         Ok(())
     }

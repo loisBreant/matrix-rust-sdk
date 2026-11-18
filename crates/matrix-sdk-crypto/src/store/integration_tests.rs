@@ -1405,6 +1405,51 @@ macro_rules! cryptostore_integration_tests {
                 assert!(restored.backup_version.is_some(), "The backup version should now be Some as well");
             }
 
+            // Filow patch 4: the stored backup key and version can be removed,
+            // and a key saved with the removal is kept.
+            #[async_test]
+            async fn test_backup_keys_forgetting() {
+                let (_account, store) = get_loaded_store("backup_keys_forgetting").await;
+                let changes = Changes {
+                    backup_decryption_key: Some(BackupDecryptionKey::new()),
+                    backup_version: Some("some_version".to_owned()),
+                    ..Default::default()
+                };
+                store.save_changes(changes).await.unwrap();
+
+                let changes = Changes { forget_backup_keys: true, ..Default::default() };
+                assert!(!changes.is_empty(), "a removal is a change");
+                store.save_changes(changes).await.unwrap();
+
+                let restored = store.load_backup_keys().await.unwrap();
+                assert!(restored.decryption_key.is_none(), "The backup decryption key should be gone");
+                assert!(restored.backup_version.is_none(), "The backup version should be gone");
+
+                let key = BackupDecryptionKey::new();
+                let public_key = key.megolm_v1_public_key().to_base64();
+                store
+                    .save_changes(Changes {
+                        backup_version: Some("other_version".to_owned()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let changes = Changes {
+                    forget_backup_keys: true,
+                    backup_decryption_key: Some(key),
+                    ..Default::default()
+                };
+                store.save_changes(changes).await.unwrap();
+
+                let restored = store.load_backup_keys().await.unwrap();
+                assert_eq!(
+                    restored.decryption_key.map(|key| key.megolm_v1_public_key().to_base64()),
+                    Some(public_key),
+                    "The key saved with the removal should be kept"
+                );
+                assert!(restored.backup_version.is_none(), "The backup version should be gone");
+            }
+
             #[async_test]
             async fn test_dehydration_pickle_key_saving() {
                 let (_account, store) = get_loaded_store("dehydration_pickle_key_saving").await;

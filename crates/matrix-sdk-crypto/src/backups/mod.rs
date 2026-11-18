@@ -437,6 +437,17 @@ impl BackupMachine {
         self.store.save_changes(changes).await
     }
 
+    /// Remove the backup decryption key and backup version from the crypto
+    /// store, so nothing resumes them at the next start.
+    ///
+    /// Filow patch 4: [`BackupMachine::save_decryption_key`] cannot remove
+    /// them (`None` leaves the stored values as they are), and
+    /// [`BackupMachine::disable_backup`] only stops the backup in memory.
+    pub async fn forget_decryption_key(&self) -> Result<(), CryptoStoreError> {
+        let changes = Changes { forget_backup_keys: true, ..Default::default() };
+        self.store.save_changes(changes).await
+    }
+
     /// Get the backup keys we have saved in our crypto store.
     pub async fn get_backup_keys(&self) -> Result<BackupKeys, CryptoStoreError> {
         self.store.load_backup_keys().await

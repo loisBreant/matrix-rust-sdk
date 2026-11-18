@@ -1236,6 +1236,13 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_kv("next_batch_token", &serialized_token)?;
                 }
 
+                // Filow patch 4: removed first, so a key saved with the removal
+                // stays.
+                if changes.forget_backup_keys {
+                    txn.clear_kv("recovery_key_v1")?;
+                    txn.clear_kv("backup_version_v1")?;
+                }
+
                 if let Some(decryption_key) = &changes.backup_decryption_key {
                     let serialized_decryption_key = this.serialize_value(decryption_key)?;
                     txn.set_kv("recovery_key_v1", &serialized_decryption_key)?;

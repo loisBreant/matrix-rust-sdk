@@ -75,6 +75,13 @@ pub struct Changes {
     pub private_identity: Option<PrivateCrossSigningIdentity>,
     pub backup_version: Option<String>,
     pub backup_decryption_key: Option<BackupDecryptionKey>,
+    /// Remove the stored backup decryption key and backup version before
+    /// `backup_decryption_key` and `backup_version` are applied. `None` in
+    /// those two means "unchanged", so without this nothing can remove them.
+    ///
+    /// Filow patch 4: a device that must stop backing up with its key, and
+    /// stop holding it, for good (nothing resumes it at the next start).
+    pub forget_backup_keys: bool,
     pub dehydrated_device_pickle_key: Option<DehydratedDeviceKey>,
     pub sessions: Vec<Session>,
     pub message_hashes: Vec<OlmMessageHash>,
@@ -169,6 +176,7 @@ impl Changes {
         self.private_identity.is_none()
             && self.backup_version.is_none()
             && self.backup_decryption_key.is_none()
+            && !self.forget_backup_keys
             && self.dehydrated_device_pickle_key.is_none()
             && self.sessions.is_empty()
             && self.message_hashes.is_empty()

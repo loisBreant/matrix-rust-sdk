@@ -489,3 +489,56 @@ async fn test_an_adopted_backup_key_replaces_the_stored_one() {
     let keys = olm.as_ref().unwrap().backup_machine().get_backup_keys().await.unwrap();
     assert_eq!(keys.backup_version.as_deref(), Some("1"), "the stored version changed");
 }
+
+// A device that must stop holding its backup key forgets it, and the
+// version it backed up to: nothing is left for the next start to resume, and
+// no key for a device asking for it. The homeserver's version stays.
+#[async_test]
+async fn test_a_forgotten_backup_key_is_neither_held_nor_resumed() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, _backup) = first_device_with_backup(&server).await;
+
+    first.encryption().backups().forget_backup_key().await.unwrap();
+
+    assert!(!first.encryption().backups().are_enabled().await);
+    assert_eq!(first.encryption().backups().stored_backup_public_key().await.unwrap(), None);
+    let olm = first.olm_machine_for_testing().await;
+    let keys = olm.as_ref().unwrap().backup_machine().get_backup_keys().await.unwrap();
+    assert!(keys.decryption_key.is_none(), "the key is still stored");
+    assert!(keys.backup_version.is_none(), "the version is still stored");
+}
+
+// A version created with a key the caller chose is created under that key,
+// and the device stores and backs up with it.
+#[async_test]
+async fn test_a_version_is_created_with_the_key_given() {
+    let server = MatrixMockServer::new().await;
+    let account_data = AccountData::default();
+    account_data.mount(&server).await;
+    let (first, _) = first_device(&server).await;
+    let created = Arc::new(Mutex::new(None::<Value>));
+    let seen = created.clone();
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/.*/room_keys/version$"))
+        .respond_with(move |request: &Request| {
+            *seen.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({ "version": "2" }))
+        })
+        .mount(server.server())
+        .await;
+    let given = BackupDecryptionKey::new();
+    let public_key = given.megolm_v1_public_key().to_base64();
+
+    first.encryption().backups().create_with_key(&given.to_base64()).await.unwrap();
+
+    let body = created.lock().unwrap().clone().expect("a version was created");
+    assert_eq!(body["auth_data"]["public_key"], json!(public_key));
+    assert_eq!(stored_backup_key(&first).await, Some(public_key));
+    assert!(first.encryption().backups().are_enabled().await);
+    assert_matches!(
+        first.encryption().backups().create_with_key("not a key").await,
+        Err(matrix_sdk::Error::SerdeJson(_))
+    );
+}

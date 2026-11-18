@@ -305,6 +305,11 @@ impl CryptoStore for MemoryStore {
             }
         }
 
+        // Filow patch 4: removed first, so a key saved with the removal stays.
+        if changes.forget_backup_keys {
+            *self.backup_keys.write().await = BackupKeys::default();
+        }
+
         if let Some(key) = changes.backup_decryption_key {
             self.backup_keys.write().await.decryption_key = Some(key);
         }
