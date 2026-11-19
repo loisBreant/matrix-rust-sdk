@@ -315,9 +315,12 @@ checked against the key the request about to go is encrypted to, after the
 request is made: no change of key between a check and the request gets
 past it, and a key enabled beside the stored one, or stored later by any
 path, gets nothing until released in turn. A refused request is dropped
-without marking its room keys backed up, so the next one is made afresh
-with the key enabled then. A release triggers an upload of what arrived
-meanwhile. `wait_for_steady_state()` returns
+without marking its room keys backed up and made once more with the key
+enabled then (it may have been made under another); refused again, nothing
+goes. Each hold returns a new generation, and a release names the hold it
+ends: one meant for an earlier hold (an operation that started before a
+later hold and ends after it) is refused, so it cannot undo the later hold.
+A release triggers an upload of what arrived meanwhile. `wait_for_steady_state()` returns
 `SteadyStateError::BackupDisabled` once the upload task goes back to idle
 while the enabled key may not be uploaded to, rather than wait for a
 release. The gate lives in this `Client`'s memory: a client built again
@@ -353,7 +356,9 @@ held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
 Tests: `test_held_uploads_wait_for_their_release`,
 `test_a_hold_placed_while_waiting_ends_the_wait`,
 `test_a_release_covers_only_the_key_it_names`,
-`test_a_release_does_not_cover_a_key_enabled_beside_the_stored_one` and
+`test_a_release_does_not_cover_a_key_enabled_beside_the_stored_one`,
+`test_a_release_for_an_earlier_hold_is_refused`,
+`test_a_request_made_under_another_key_is_made_again` and
 `test_uploads_are_not_held_by_default` in matrix-sdk's
 `encryption/backups/mod.rs`; `test_a_backup_request_names_its_key` in
 matrix-sdk-crypto's `backups/mod.rs`;

@@ -414,11 +414,15 @@ impl Backups {
     }
 
     /// Hold every upload of room keys to the backup, until
-    /// [`Backups::release_uploads_to()`]. Room keys keep arriving and are
-    /// stored as not backed up, so nothing is lost: they are uploaded once
-    /// released. An upload already sent is not recalled. Holds for this
-    /// [`Client`] only, in memory: a client built again starts with uploads
-    /// not held.
+    /// [`Backups::release_uploads_to()`] with the generation returned here.
+    /// Room keys keep arriving and are stored as not backed up, so nothing is
+    /// lost: they are uploaded once released. An upload already sent is not
+    /// recalled. Holds for this [`Client`] only, in memory: a client built
+    /// again starts with uploads not held.
+    ///
+    /// Each hold returns a new generation, and only a release naming the
+    /// newest one applies: a release meant for an earlier hold (an operation
+    /// that started before it, ending late) cannot undo a later hold.
     ///
     /// Filow patch 6: a device resumes the backup key it stores when it
     /// starts (the [`OlmMachine`] loads it, and the post-login task enables
@@ -427,33 +431,44 @@ impl Backups {
     /// current again (label and key), one a device revoked since knows. The
     /// caller holds uploads before the client restores its session, and
     /// releases them once it has checked the key against what it trusts.
-    pub fn hold_uploads(&self) {
-        *self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() = UploadGate::Held;
+    pub fn hold_uploads(&self) -> u64 {
+        let mut gate = self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap();
+        gate.0 += 1;
+        gate.1 = UploadGate::Held;
+        gate.0
     }
 
-    /// Let room keys reach the backup again after [`Backups::hold_uploads()`],
-    /// starting with those that arrived meanwhile, but only while the backup
-    /// key this device stores is the one whose public half (unpadded base64,
-    /// as a backup version's `auth_data.public_key` carries it) is
-    /// `backup_public_key`: a key stored afterwards by any path (another
+    /// Let room keys reach the backup again after the hold of generation
+    /// `hold` ([`Backups::hold_uploads()`]), starting with those that arrived
+    /// meanwhile, but only those of requests whose room keys are encrypted to
+    /// the backup key whose public half (unpadded base64, as a backup
+    /// version's `auth_data.public_key` carries it) is `backup_public_key`: a
+    /// key enabled afterwards, or beside the stored one, by any path (another
     /// version taken up, a key received as a secret) is held until released
-    /// in turn.
-    pub fn release_uploads_to(&self, backup_public_key: &str) {
-        *self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() =
-            UploadGate::ReleasedTo(backup_public_key.to_owned());
+    /// in turn. Returns false, and changes nothing, when a newer hold was
+    /// placed since.
+    pub fn release_uploads_to(&self, hold: u64, backup_public_key: &str) -> bool {
+        {
+            let mut gate = self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap();
+            if gate.0 != hold {
+                return false;
+            }
+            gate.1 = UploadGate::ReleasedTo(backup_public_key.to_owned());
+        }
         self.maybe_trigger_backup();
+        true
     }
 
     /// Whether uploads of room keys to the backup are held
     /// ([`Backups::hold_uploads()`]), as opposed to never held or released.
     pub fn uploads_held(&self) -> bool {
-        *self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() == UploadGate::Held
+        self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().1 == UploadGate::Held
     }
 
     /// The public half of the backup key uploads were last released to
     /// ([`Backups::release_uploads_to()`]), if they are released.
     pub fn uploads_released_to(&self) -> Option<String> {
-        match &*self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() {
+        match &self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().1 {
             UploadGate::ReleasedTo(key) => Some(key.clone()),
             UploadGate::Open | UploadGate::Held => None,
         }
@@ -462,7 +477,7 @@ impl Backups {
     /// Whether room keys encrypted to the backup key whose public half is
     /// `backup_key` may be uploaded: never held, or released to that key.
     fn uploads_allowed_to(&self, backup_key: &str) -> bool {
-        match &*self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() {
+        match &self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().1 {
             UploadGate::Open => true,
             UploadGate::Held => false,
             UploadGate::ReleasedTo(released) => released == backup_key,
@@ -472,7 +487,7 @@ impl Backups {
     /// Whether the backup key room keys are encrypted to now may not be
     /// uploaded to (held, or released to another key).
     pub(crate) async fn uploads_blocked(&self) -> Result<bool, Error> {
-        let gate = self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().clone();
+        let gate = self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().1.clone();
         Ok(match gate {
             UploadGate::Open => false,
             UploadGate::Held => true,
@@ -941,15 +956,23 @@ impl Backups {
         // Filow patch 6: the gate is checked against the key the request
         // about to go is encrypted to, after it is made, so no change of key
         // in between gets past it. A refused request is dropped, its room
-        // keys left marked not backed up, and no steady state is claimed.
+        // keys left marked not backed up, and made once more with the key
+        // enabled now (it may have been made under another); refused again,
+        // no steady state is claimed.
+        let mut remade = false;
         while let Some((request_id, request, backup_key)) =
             olm_machine.backup_machine().backup_with_key().await?
         {
             if !self.uploads_allowed_to(&backup_key) {
                 olm_machine.backup_machine().discard_pending_backup().await;
-                trace!("Uploads to the backup are held");
-                return Ok(());
+                if remade {
+                    trace!("Uploads to the backup are held");
+                    return Ok(());
+                }
+                remade = true;
+                continue;
             }
+            remade = false;
             self.send_backup_request(olm_machine, &request_id, request).await?;
         }
 
@@ -1789,7 +1812,7 @@ mod test {
                 )
         };
 
-        backups.hold_uploads();
+        let hold = backups.hold_uploads();
         assert!(backups.uploads_held());
 
         server.mock_add_room_keys_version().ok().expect(1).mount().await;
@@ -1831,7 +1854,7 @@ mod test {
         // so the release's own trigger is what sends the key.
         crate::sleep::sleep(Duration::from_millis(300)).await;
         let stored = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
-        backups.release_uploads_to(&stored);
+        assert!(backups.release_uploads_to(hold, &stored));
         assert!(!backups.uploads_held());
         assert_eq!(backups.uploads_released_to(), Some(stored));
         // Released, the key goes up on its own, with nobody waiting for it.
@@ -1944,10 +1967,10 @@ mod test {
                 )
         };
         server.mock_add_room_keys_version().ok().expect(1).mount().await;
-        backups.hold_uploads();
+        let hold = backups.hold_uploads();
         backups.create().await.expect("We should be able to create a new backup");
         let released = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
-        backups.release_uploads_to(&released);
+        assert!(backups.release_uploads_to(hold, &released));
         let machine = client.olm_machine().await;
         let backup_machine = machine.as_ref().unwrap().backup_machine().clone();
         drop(machine);
@@ -2001,6 +2024,78 @@ mod test {
             .expect("a steady state once the released key is back");
     }
 
+    // Filow patch 6, review of Filow #1691 (L-A): a release meant for an
+    // earlier hold cannot undo a later one.
+    #[async_test]
+    async fn test_a_release_for_an_earlier_hold_is_refused() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+
+        let earlier = backups.hold_uploads();
+        let later = backups.hold_uploads();
+        assert!(later > earlier);
+        assert!(!backups.release_uploads_to(earlier, "a key"));
+        assert!(backups.uploads_held());
+        assert_eq!(backups.uploads_released_to(), None);
+
+        assert!(backups.release_uploads_to(later, "a key"));
+        assert_eq!(backups.uploads_released_to().as_deref(), Some("a key"));
+    }
+
+    // Filow patch 6, review of Filow #1691 (I-2): a request made under a key
+    // no longer enabled is dropped and made again with the key enabled now,
+    // which goes up if it is the released one.
+    #[async_test]
+    async fn test_a_request_made_under_another_key_is_made_again() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
+        let hold = backups.hold_uploads();
+        backups.create().await.expect("We should be able to create a new backup");
+        let released = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
+        let machine = client.olm_machine().await;
+        let backup_machine = machine.as_ref().unwrap().backup_machine().clone();
+        machine
+            .as_ref()
+            .unwrap()
+            .store()
+            .import_exported_room_keys(vec![room_key()], |_, _| {})
+            .await
+            .expect("We should be able to import a room key");
+        drop(machine);
+        let version = backup_machine.backup_version().await.expect("an enabled version");
+        let beside = BackupDecryptionKey::new().megolm_v1_public_key();
+        beside.set_version(version.clone());
+        backup_machine.enable_backup_v1(beside.clone()).await.unwrap();
+        let (_, _, made_under) =
+            backup_machine.backup_with_key().await.unwrap().expect("a request");
+        assert_eq!(made_under, beside.to_base64());
+        let stored = backup_machine
+            .get_backup_keys()
+            .await
+            .unwrap()
+            .decryption_key
+            .unwrap()
+            .megolm_v1_public_key();
+        stored.set_version(version);
+        backup_machine.enable_backup_v1(stored).await.unwrap();
+
+        let _one = Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex("room_keys/keys$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "etag": "1", "count": 1 })),
+            )
+            .expect(1)
+            .named("the room key, made again under the released key")
+            .mount_as_scoped(server.server())
+            .await;
+        assert!(backups.release_uploads_to(hold, &released));
+        backups.backup_room_keys().await.expect("an upload");
+        assert_eq!(backup_machine.room_key_counts().await.unwrap().backed_up, 1);
+    }
+
     // Filow patch 6: without a hold, nothing changes.
     #[async_test]
     async fn test_uploads_are_not_held_by_default() {
@@ -2026,10 +2121,10 @@ mod test {
                 )
         };
         server.mock_add_room_keys_version().ok().expect(1).mount().await;
-        backups.hold_uploads();
+        let hold = backups.hold_uploads();
         backups.create().await.expect("We should be able to create a new backup");
         let released = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
-        backups.release_uploads_to(&released);
+        assert!(backups.release_uploads_to(hold, &released));
         let other = BackupDecryptionKey::new();
         backups.adopt_backup_key(&other.to_base64()).await.expect("adopt another key");
         {
@@ -2061,7 +2156,7 @@ mod test {
             .named("the other key, once released")
             .mount_as_scoped(server.server())
             .await;
-        backups.release_uploads_to(&other.megolm_v1_public_key().to_base64());
+        assert!(backups.release_uploads_to(hold, &other.megolm_v1_public_key().to_base64()));
         backups.wait_for_steady_state().await.expect("a steady state once released");
     }
 

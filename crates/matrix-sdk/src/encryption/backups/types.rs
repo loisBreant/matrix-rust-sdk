@@ -62,8 +62,9 @@ pub(crate) struct BackupClientState {
     /// value.
     pub(super) backup_exists_on_server: RwLock<Option<bool>>,
 
-    /// Which uploads of room keys to the backup may go (Filow patch 6).
-    pub(super) upload_gate: Mutex<UploadGate>,
+    /// Which uploads of room keys to the backup may go, and how many holds
+    /// were placed (Filow patch 6).
+    pub(super) upload_gate: Mutex<(u64, UploadGate)>,
 }
 
 /// Which uploads of room keys to the backup may go (Filow patch 6).
@@ -74,8 +75,9 @@ pub(super) enum UploadGate {
     Open,
     /// None ([`Backups::hold_uploads()`]).
     Held,
-    /// Only while the stored backup key is the one whose public half
-    /// (unpadded base64) is given ([`Backups::release_uploads_to()`]).
+    /// Only those of requests whose room keys are encrypted to the backup key
+    /// whose public half (unpadded base64) is given
+    /// ([`Backups::release_uploads_to()`]).
     ReleasedTo(String),
 }
 
@@ -112,7 +114,7 @@ impl Default for BackupClientState {
             global_state: Default::default(),
             room_keys_broadcaster: broadcast::Sender::new(100),
             backup_exists_on_server: RwLock::new(None),
-            upload_gate: Mutex::new(UploadGate::Open),
+            upload_gate: Mutex::new((0, UploadGate::Open)),
         }
     }
 }

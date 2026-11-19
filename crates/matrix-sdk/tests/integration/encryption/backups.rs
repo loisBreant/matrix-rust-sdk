@@ -454,7 +454,7 @@ async fn test_resumed_backup_uploads_nothing_while_held() -> TestResult {
         .sqlite_store(dir.path(), None)
         .build()
         .await?;
-    client.encryption().backups().hold_uploads();
+    let hold = client.encryption().backups().hold_uploads();
     client.restore_session(session).await?;
     client.encryption().wait_for_e2ee_initialization_tasks().await;
     assert!(client.encryption().backups().are_enabled().await, "the stored key is resumed");
@@ -486,7 +486,7 @@ async fn test_resumed_backup_uploads_nothing_while_held() -> TestResult {
         upload().expect(1).named("the held key, once released").mount_as_scoped(&server).await;
     let stored =
         client.encryption().backups().stored_backup_public_key().await?.expect("a stored key");
-    client.encryption().backups().release_uploads_to(&stored);
+    assert!(client.encryption().backups().release_uploads_to(hold, &stored));
     client.encryption().backups().wait_for_steady_state().await?;
 
     Ok(())
