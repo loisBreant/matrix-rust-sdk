@@ -1827,6 +1827,9 @@ mod test {
             .named("the held key, once released")
             .mount_as_scoped(server.server())
             .await;
+        // Let the upload task run through every trigger it got while held,
+        // so the release's own trigger is what sends the key.
+        crate::sleep::sleep(Duration::from_millis(300)).await;
         let stored = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
         backups.release_uploads_to(&stored);
         assert!(!backups.uploads_held());
