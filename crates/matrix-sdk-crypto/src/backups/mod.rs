@@ -71,6 +71,9 @@ struct PendingBackup {
     request_id: OwnedTransactionId,
     request: KeysBackupRequest,
     sessions: BTreeMap<OwnedRoomId, BTreeMap<SenderKey, BTreeSet<SessionId>>>,
+    /// The public half (unpadded base64) of the backup key the room keys in
+    /// `request` are encrypted to (Filow patch 6).
+    backup_key: String,
 }
 
 /// The result of a signature verification of a signed JSON object.
@@ -479,6 +482,44 @@ impl BackupMachine {
         }
     }
 
+    /// [`BackupMachine::backup()`], with the public half (unpadded base64) of
+    /// the backup key the request's room keys are encrypted to.
+    ///
+    /// Filow patch 6: a caller that lets room keys go only to a key it
+    /// vouched for checks the key of the very request it is about to send,
+    /// not the key enabled when it last looked.
+    pub async fn backup_with_key(
+        &self,
+    ) -> Result<Option<(OwnedTransactionId, KeysBackupRequest, String)>, CryptoStoreError> {
+        let mut request = self.pending_backup.write().await;
+
+        if request.is_none() {
+            *request = self.backup_helper().await?;
+        }
+
+        Ok(request
+            .as_ref()
+            .map(|r| (r.request_id.clone(), r.request.clone(), r.backup_key.clone())))
+    }
+
+    /// Drop the request [`BackupMachine::backup()`] would hand out again,
+    /// without marking its room keys as backed up: the next request is made
+    /// afresh, with the backup key enabled then (Filow patch 6).
+    pub async fn discard_pending_backup(&self) {
+        self.pending_backup.write().await.take();
+    }
+
+    /// The public half (unpadded base64) of the backup key room keys are
+    /// encrypted to now, if a backup is enabled (Filow patch 6).
+    pub async fn enabled_backup_public_key(&self) -> Option<String> {
+        self.backup_key
+            .read()
+            .await
+            .as_ref()
+            .filter(|key| key.backup_version().is_some())
+            .map(|key| key.to_base64())
+    }
+
     pub(crate) async fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,
@@ -561,6 +602,7 @@ impl BackupMachine {
             request_id: TransactionId::new(),
             request: KeysBackupRequest { version, rooms: backup },
             sessions: session_record,
+            backup_key: backup_key.to_base64(),
         };
 
         Ok(Some(request))
@@ -802,6 +844,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // Filow patch 6: a request says which backup key its room keys are
+    // encrypted to, a dropped one is made afresh with the key enabled then,
+    // and the enabled key is readable on its own.
+    #[async_test]
+    async fn test_a_backup_request_names_its_key() -> Result<(), OlmError> {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        let backup_machine = machine.backup_machine();
+        machine.create_outbound_group_session_with_defaults_test_helper(room_id()).await?;
+        assert_eq!(backup_machine.enabled_backup_public_key().await, None);
+
+        let first = BackupDecryptionKey::new().megolm_v1_public_key();
+        first.set_version("1".to_owned());
+        backup_machine.enable_backup_v1(first.clone()).await?;
+        assert_eq!(backup_machine.enabled_backup_public_key().await, Some(first.to_base64()));
+        let (request_id, _, key) =
+            backup_machine.backup_with_key().await?.expect("a request for the room key");
+        assert_eq!(key, first.to_base64());
+
+        let second = BackupDecryptionKey::new().megolm_v1_public_key();
+        second.set_version("1".to_owned());
+        backup_machine.enable_backup_v1(second.clone()).await?;
+        let (same_id, _, same_key) = backup_machine.backup_with_key().await?.expect("the same");
+        assert_eq!((same_id, same_key), (request_id.clone(), first.to_base64()));
+
+        backup_machine.discard_pending_backup().await;
+        let (fresh_id, _, fresh_key) = backup_machine.backup_with_key().await?.expect("afresh");
+        assert_ne!(fresh_id, request_id);
+        assert_eq!(fresh_key, second.to_base64());
+        let counts = backup_machine.room_key_counts().await?;
+        assert_eq!(counts.backed_up, 0, "a dropped request marks nothing backed up");
+
+        Ok(())
     }
 
     #[async_test]

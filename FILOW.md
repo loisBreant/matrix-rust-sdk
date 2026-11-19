@@ -300,21 +300,29 @@ passes both ways. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_dev
 
 ## Patch 6: hold room-key uploads to the backup until released
 
-`crates/matrix-sdk/src/encryption/backups/{mod,types,futures}.rs`, additive:
+`crates/matrix-sdk/src/encryption/backups/{mod,types,futures}.rs` and
+`crates/matrix-sdk-crypto/src/backups/mod.rs`, additive:
 `Backups::hold_uploads()`, `Backups::release_uploads_to(public_key)`,
-`Backups::uploads_held()` and `Backups::uploads_released_to()`. While held,
-`backup_room_keys` (the one place room keys are sent to the backup, which
-the upload task, sync and sliding sync all trigger) sends nothing and
-leaves them marked not backed up. A release names the backup key it covers
-(its public half): uploads go only while the key the device stores is that
-one, so a key stored afterwards by any path (another version taken up, a
-key received as a secret) is held until released in turn. A release
-triggers an upload of what arrived meanwhile. `wait_for_steady_state()`
-returns `SteadyStateError::BackupDisabled` once the upload task goes back
-to idle while uploads are blocked, rather than wait for a release. The gate
-lives in this `Client`'s memory: a client built again starts open, so
-upstream behaviour is unchanged unless the caller holds uploads. An upload
-already sent when the hold is placed is not recalled.
+`Backups::uploads_held()`, `Backups::uploads_released_to()` and
+`Backups::enabled_backup_public_key()` in matrix-sdk;
+`BackupMachine::backup_with_key()`, `discard_pending_backup()` and
+`enabled_backup_public_key()` in matrix-sdk-crypto (a pending request now
+records the public half of the key its room keys are encrypted to). While
+held, `backup_room_keys` (the one place room keys are sent to the backup,
+which the upload task, sync and sliding sync all trigger) sends nothing. A
+release names the backup key it covers (its public half), and the gate is
+checked against the key the request about to go is encrypted to, after the
+request is made: no change of key between a check and the request gets
+past it, and a key enabled beside the stored one, or stored later by any
+path, gets nothing until released in turn. A refused request is dropped
+without marking its room keys backed up, so the next one is made afresh
+with the key enabled then. A release triggers an upload of what arrived
+meanwhile. `wait_for_steady_state()` returns
+`SteadyStateError::BackupDisabled` once the upload task goes back to idle
+while the enabled key may not be uploaded to, rather than wait for a
+release. The gate lives in this `Client`'s memory: a client built again
+starts open, so upstream behaviour is unchanged unless the caller holds
+uploads. An upload already sent when the hold is placed is not recalled.
 
 ### Why Filow needs it
 
@@ -333,7 +341,9 @@ so that it never settles (Filow #1691, found in the review of Filow
 session is restored, and releases them only once its check vouches for the
 key the device backs up with. The release names that key, so a key the
 device comes to store by another path is never uploaded to on the strength
-of a release meant for another (Filow's review of #1691, L2). Holding uploads rather than not resuming the
+of a release meant for another (Filow's review of #1691, L2), and the key
+checked is the one the request is encrypted to, not the stored one, which
+can differ from it (Filow's automated review of #1691). Holding uploads rather than not resuming the
 key leaves every other behaviour of a resumed backup as it was (the key is
 still enabled and still used to download), and nothing is lost: the keys
 held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
@@ -342,8 +352,11 @@ held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
 
 Tests: `test_held_uploads_wait_for_their_release`,
 `test_a_hold_placed_while_waiting_ends_the_wait`,
-`test_a_release_covers_only_the_key_it_names` and
-`test_uploads_are_not_held_by_default` in `encryption/backups/mod.rs`;
+`test_a_release_covers_only_the_key_it_names`,
+`test_a_release_does_not_cover_a_key_enabled_beside_the_stored_one` and
+`test_uploads_are_not_held_by_default` in matrix-sdk's
+`encryption/backups/mod.rs`; `test_a_backup_request_names_its_key` in
+matrix-sdk-crypto's `backups/mod.rs`;
 `test_resumed_backup_uploads_nothing_while_held` in
 `tests/integration/encryption/backups.rs` (a client restarted from its
 SQLite store, holding uploads before it restores its session, resumes its

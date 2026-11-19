@@ -459,17 +459,36 @@ impl Backups {
         }
     }
 
-    /// Whether room keys may not be uploaded now: uploads are held, or
-    /// released to another key than the one stored.
+    /// Whether room keys encrypted to the backup key whose public half is
+    /// `backup_key` may be uploaded: never held, or released to that key.
+    fn uploads_allowed_to(&self, backup_key: &str) -> bool {
+        match &*self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap() {
+            UploadGate::Open => true,
+            UploadGate::Held => false,
+            UploadGate::ReleasedTo(released) => released == backup_key,
+        }
+    }
+
+    /// Whether the backup key room keys are encrypted to now may not be
+    /// uploaded to (held, or released to another key).
     pub(crate) async fn uploads_blocked(&self) -> Result<bool, Error> {
         let gate = self.client.inner.e2ee.backup_state.upload_gate.lock().unwrap().clone();
         Ok(match gate {
             UploadGate::Open => false,
             UploadGate::Held => true,
             UploadGate::ReleasedTo(released) => {
-                self.stored_backup_public_key().await?.as_deref() != Some(released.as_str())
+                self.enabled_backup_public_key().await?.as_deref() != Some(released.as_str())
             }
         })
+    }
+
+    /// The public half (unpadded base64) of the backup key room keys are
+    /// encrypted to now, if a backup is enabled: the key uploads go to, which
+    /// is not always the one [`Backups::stored_backup_public_key()`] reads.
+    pub async fn enabled_backup_public_key(&self) -> Result<Option<String>, Error> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        Ok(olm_machine.backup_machine().enabled_backup_public_key().await)
     }
 
     /// The public half (unpadded base64, as a backup version's
@@ -919,16 +938,18 @@ impl Backups {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        loop {
-            // Filow patch 6: while held, the room keys stay marked not backed
-            // up, and no steady state is claimed.
-            if self.uploads_blocked().await? {
+        // Filow patch 6: the gate is checked against the key the request
+        // about to go is encrypted to, after it is made, so no change of key
+        // in between gets past it. A refused request is dropped, its room
+        // keys left marked not backed up, and no steady state is claimed.
+        while let Some((request_id, request, backup_key)) =
+            olm_machine.backup_machine().backup_with_key().await?
+        {
+            if !self.uploads_allowed_to(&backup_key) {
+                olm_machine.backup_machine().discard_pending_backup().await;
                 trace!("Uploads to the backup are held");
                 return Ok(());
             }
-            let Some((request_id, request)) = olm_machine.backup_machine().backup().await? else {
-                break;
-            };
             self.send_backup_request(olm_machine, &request_id, request).await?;
         }
 
@@ -1860,10 +1881,37 @@ mod test {
                 .expect("We should be able to import a room key");
         }
 
+        // A second room key arrives while the first is on its way, and the
+        // hold comes with it: the second is held, so no steady state comes.
+        let session = vodozemac::megolm::GroupSession::new(Default::default());
+        let second: ExportedRoomKey = serde_json::from_value(json!({
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "room_id": "!DovneieKSTkdHKpIXy:morpheus.localhost",
+            "sender_key": "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA",
+            "session_id": session.session_id(),
+            "session_key": vodozemac::megolm::InboundGroupSession::new(
+                &session.session_key(),
+                Default::default(),
+            )
+            .export_at(0)
+            .unwrap()
+            .to_base64(),
+            "sender_claimed_keys": {},
+            "forwarding_curve25519_key_chain": []
+        }))
+        .unwrap();
         let wait = backups.wait_for_steady_state();
         let hold = async {
             crate::sleep::sleep(Duration::from_millis(100)).await;
             backups.hold_uploads();
+            let machine = client.olm_machine().await;
+            machine
+                .as_ref()
+                .unwrap()
+                .store()
+                .import_exported_room_keys(vec![second], |_, _| {})
+                .await
+                .expect("We should be able to import a second room key");
         };
         let (waited, ()) = futures_util::join!(
             matrix_sdk_common::timeout::timeout(wait.into_future(), Duration::from_secs(5)),
@@ -1873,6 +1921,81 @@ mod test {
             waited.expect("the wait ends"),
             Err(futures::SteadyStateError::BackupDisabled)
         );
+    }
+
+    // Filow patch 6, review of Filow #1691: a release covers the key room
+    // keys are encrypted to, not the key stored. A key enabled beside the
+    // stored one gets nothing, and a request made for it is dropped rather
+    // than handed out again, so the released key gets the room key once it
+    // is enabled again.
+    #[async_test]
+    async fn test_a_release_does_not_cover_a_key_enabled_beside_the_stored_one() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+        let upload = || {
+            Mock::given(method("PUT"))
+                .and(wiremock::matchers::path_regex("room_keys/keys$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({ "etag": "1", "count": 1 })),
+                )
+        };
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
+        backups.hold_uploads();
+        backups.create().await.expect("We should be able to create a new backup");
+        let released = backups.stored_backup_public_key().await.unwrap().expect("a stored key");
+        backups.release_uploads_to(&released);
+        let machine = client.olm_machine().await;
+        let backup_machine = machine.as_ref().unwrap().backup_machine().clone();
+        drop(machine);
+        let version = backup_machine.backup_version().await.expect("an enabled version");
+        let beside = BackupDecryptionKey::new().megolm_v1_public_key();
+        beside.set_version(version.clone());
+        backup_machine.enable_backup_v1(beside.clone()).await.unwrap();
+        assert_eq!(backups.stored_backup_public_key().await.unwrap(), Some(released.clone()));
+        assert_eq!(backups.enabled_backup_public_key().await.unwrap(), Some(beside.to_base64()));
+        {
+            let machine = client.olm_machine().await;
+            machine
+                .as_ref()
+                .unwrap()
+                .store()
+                .import_exported_room_keys(vec![room_key()], |_, _| {})
+                .await
+                .expect("We should be able to import a room key");
+        }
+
+        {
+            let _none = upload()
+                .expect(0)
+                .named("no upload to the key enabled beside")
+                .mount_as_scoped(server.server())
+                .await;
+            backups.backup_room_keys().await.expect("a held upload is no error");
+            assert_matches!(
+                backups.wait_for_steady_state().await,
+                Err(futures::SteadyStateError::BackupDisabled)
+            );
+        }
+
+        let _one = upload()
+            .expect(1)
+            .named("the released key, enabled again")
+            .mount_as_scoped(server.server())
+            .await;
+        let stored = backup_machine
+            .get_backup_keys()
+            .await
+            .unwrap()
+            .decryption_key
+            .unwrap()
+            .megolm_v1_public_key();
+        stored.set_version(version);
+        backup_machine.enable_backup_v1(stored).await.unwrap();
+        backups
+            .wait_for_steady_state()
+            .await
+            .expect("a steady state once the released key is back");
     }
 
     // Filow patch 6: without a hold, nothing changes.
