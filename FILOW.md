@@ -307,7 +307,8 @@ room keys are sent to the backup, which the upload task, sync and sliding
 sync all trigger) sends nothing and leaves them marked not backed up;
 `release_uploads()` lets them go and triggers an upload of what arrived
 meanwhile. `wait_for_steady_state()` returns `SteadyStateError::BackupDisabled`
-at once while held, rather than wait for a release. The hold lives in this
+once the upload task goes back to idle while held, rather than wait for a
+release. The hold lives in this
 `Client`'s memory: a client built again starts with uploads not held, so
 upstream behaviour is unchanged unless the caller holds them. An upload
 already sent when the hold is placed is not recalled.
@@ -334,7 +335,8 @@ held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
 2026-11-18) has no way to keep a resumed backup from uploading:
 `resume_backup_from_stored_backup_key` and `backup_room_keys` are unchanged.
 
-Tests: `test_held_uploads_wait_for_their_release` and
+Tests: `test_held_uploads_wait_for_their_release`,
+`test_a_hold_placed_while_waiting_ends_the_wait` and
 `test_uploads_are_not_held_by_default` in `encryption/backups/mod.rs`;
 `test_resumed_backup_uploads_nothing_while_held` in
 `tests/integration/encryption/backups.rs` (a client restarted from its

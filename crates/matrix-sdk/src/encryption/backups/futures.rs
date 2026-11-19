@@ -111,11 +111,7 @@ impl<'a> IntoFuture for WaitForSteadyState<'a> {
 
             trace!("Waiting for the upload steady state");
 
-            // Filow patch 6: held uploads reach no steady state until
-            // released; waiting would hang.
-            let ret = if backups.uploads_held() {
-                Err(SteadyStateError::BackupDisabled)
-            } else if backups.are_enabled().await {
+            let ret = if backups.are_enabled().await {
                 backups.maybe_trigger_backup();
 
                 let mut ret = Ok(());
@@ -144,6 +140,10 @@ impl<'a> IntoFuture for WaitForSteadyState<'a> {
                             ret = Err(SteadyStateError::Lagged);
                             break;
                         }
+                        // Filow patch 6: held uploads reach no steady
+                        // state until released. The upload task goes back
+                        // to idle without claiming one, and waiting on
+                        // would hang.
                         Ok(UploadState::Idle) if backups.uploads_held() => {
                             ret = Err(SteadyStateError::BackupDisabled);
                             break;
