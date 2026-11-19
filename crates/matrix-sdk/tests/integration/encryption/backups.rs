@@ -484,7 +484,9 @@ async fn test_resumed_backup_uploads_nothing_while_held() -> TestResult {
 
     let _one =
         upload().expect(1).named("the held key, once released").mount_as_scoped(&server).await;
-    client.encryption().backups().release_uploads();
+    let stored =
+        client.encryption().backups().stored_backup_public_key().await?.expect("a stored key");
+    client.encryption().backups().release_uploads_to(&stored);
     client.encryption().backups().wait_for_steady_state().await?;
 
     Ok(())

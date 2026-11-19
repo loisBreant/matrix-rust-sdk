@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -62,9 +62,21 @@ pub(crate) struct BackupClientState {
     /// value.
     pub(super) backup_exists_on_server: RwLock<Option<bool>>,
 
-    /// Whether uploads of room keys to the backup are held until
-    /// [`Backups::release_uploads()`] (Filow patch 6).
-    pub(super) uploads_held: AtomicBool,
+    /// Which uploads of room keys to the backup may go (Filow patch 6).
+    pub(super) upload_gate: Mutex<UploadGate>,
+}
+
+/// Which uploads of room keys to the backup may go (Filow patch 6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum UploadGate {
+    /// Every upload, as upstream: no hold was ever placed.
+    #[default]
+    Open,
+    /// None ([`Backups::hold_uploads()`]).
+    Held,
+    /// Only while the stored backup key is the one whose public half
+    /// (unpadded base64) is given ([`Backups::release_uploads_to()`]).
+    ReleasedTo(String),
 }
 
 impl BackupClientState {
@@ -100,7 +112,7 @@ impl Default for BackupClientState {
             global_state: Default::default(),
             room_keys_broadcaster: broadcast::Sender::new(100),
             backup_exists_on_server: RwLock::new(None),
-            uploads_held: AtomicBool::new(false),
+            upload_gate: Mutex::new(UploadGate::Open),
         }
     }
 }

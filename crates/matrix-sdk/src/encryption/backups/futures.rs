@@ -144,7 +144,9 @@ impl<'a> IntoFuture for WaitForSteadyState<'a> {
                         // state until released. The upload task goes back
                         // to idle without claiming one, and waiting on
                         // would hang.
-                        Ok(UploadState::Idle) if backups.uploads_held() => {
+                        Ok(UploadState::Idle)
+                            if backups.uploads_blocked().await.unwrap_or(true) =>
+                        {
                             ret = Err(SteadyStateError::BackupDisabled);
                             break;
                         }

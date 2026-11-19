@@ -301,16 +301,19 @@ passes both ways. In Filow, `no_device_serves_a_secret_to_a_cross_signed_own_dev
 ## Patch 6: hold room-key uploads to the backup until released
 
 `crates/matrix-sdk/src/encryption/backups/{mod,types,futures}.rs`, additive:
-`Backups::hold_uploads()`, `Backups::release_uploads()` and
-`Backups::uploads_held()`. While held, `backup_room_keys` (the one place
-room keys are sent to the backup, which the upload task, sync and sliding
-sync all trigger) sends nothing and leaves them marked not backed up;
-`release_uploads()` lets them go and triggers an upload of what arrived
-meanwhile. `wait_for_steady_state()` returns `SteadyStateError::BackupDisabled`
-once the upload task goes back to idle while held, rather than wait for a
-release. The hold lives in this
-`Client`'s memory: a client built again starts with uploads not held, so
-upstream behaviour is unchanged unless the caller holds them. An upload
+`Backups::hold_uploads()`, `Backups::release_uploads_to(public_key)`,
+`Backups::uploads_held()` and `Backups::uploads_released_to()`. While held,
+`backup_room_keys` (the one place room keys are sent to the backup, which
+the upload task, sync and sliding sync all trigger) sends nothing and
+leaves them marked not backed up. A release names the backup key it covers
+(its public half): uploads go only while the key the device stores is that
+one, so a key stored afterwards by any path (another version taken up, a
+key received as a secret) is held until released in turn. A release
+triggers an upload of what arrived meanwhile. `wait_for_steady_state()`
+returns `SteadyStateError::BackupDisabled` once the upload task goes back
+to idle while uploads are blocked, rather than wait for a release. The gate
+lives in this `Client`'s memory: a client built again starts open, so
+upstream behaviour is unchanged unless the caller holds uploads. An upload
 already sent when the hold is placed is not recalled.
 
 ### Why Filow needs it
@@ -328,7 +331,9 @@ knows, and the homeserver can stall or fail only the check's own requests
 so that it never settles (Filow #1691, found in the review of Filow
 #1685). Filow holds uploads as soon as it builds a client, before the
 session is restored, and releases them only once its check vouches for the
-key the device backs up with. Holding uploads rather than not resuming the
+key the device backs up with. The release names that key, so a key the
+device comes to store by another path is never uploaded to on the strength
+of a release meant for another (Filow's review of #1691, L2). Holding uploads rather than not resuming the
 key leaves every other behaviour of a resumed backup as it was (the key is
 still enabled and still used to download), and nothing is lost: the keys
 held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
@@ -336,7 +341,8 @@ held wait in the store, marked not backed up. Upstream `main` (`7ff88556d8`,
 `resume_backup_from_stored_backup_key` and `backup_room_keys` are unchanged.
 
 Tests: `test_held_uploads_wait_for_their_release`,
-`test_a_hold_placed_while_waiting_ends_the_wait` and
+`test_a_hold_placed_while_waiting_ends_the_wait`,
+`test_a_release_covers_only_the_key_it_names` and
 `test_uploads_are_not_held_by_default` in `encryption/backups/mod.rs`;
 `test_resumed_backup_uploads_nothing_while_held` in
 `tests/integration/encryption/backups.rs` (a client restarted from its
