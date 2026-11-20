@@ -2240,3 +2240,88 @@ async fn test_verified_latch_migration() {
         assert!(!tu.dirty);
     });
 }
+
+/// Filow patch 8: the info of a decrypted Megolm event carries the ratchet
+/// index of its ciphertext, so a client can tell a homeserver's replay (the
+/// same ciphertext under another event ID, which decrypts as well as the
+/// original) from a new message.
+#[async_test]
+async fn test_decrypted_event_reports_its_megolm_message_index() {
+    let (alice, bob) =
+        get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
+    let room_id = room_id!("!test:example.org");
+
+    let to_device_requests = alice
+        .share_room_key(room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+        .await
+        .unwrap();
+    let event = ToDeviceEvent::new(
+        alice.user_id().to_owned(),
+        to_device_requests_to_content(to_device_requests),
+    );
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+    let group_session = bob
+        .store()
+        .with_transaction(async |tr| {
+            let res = bob
+                .decrypt_to_device_event(tr, &event, &mut Changes::default(), &decryption_settings)
+                .await?;
+            Ok(res)
+        })
+        .await
+        .unwrap()
+        .inbound_group_session
+        .unwrap();
+    bob.store().save_inbound_group_sessions(std::slice::from_ref(&group_session)).await.unwrap();
+
+    let mut ciphertexts = Vec::new();
+    for body in ["first", "second", "third"] {
+        let content = RoomMessageEventContent::text_plain(body);
+        let result = alice
+            .encrypt_room_event(room_id, AnyMessageLikeEventContent::RoomMessage(content))
+            .await
+            .unwrap();
+        ciphertexts.push(result.content);
+    }
+
+    let event_with = |event_id: &str, content: &Raw<crate::types::events::room::encrypted::RoomEncryptedEventContent>| {
+        json_convert(&json!({
+            "event_id": event_id,
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "sender": alice.user_id(),
+            "type": "m.room.encrypted",
+            "content": content,
+        }))
+        .unwrap()
+    };
+    let decrypted_index = async |event: &Raw<crate::types::events::room::encrypted::EncryptedEvent>| {
+        let result = bob.try_decrypt_room_event(event, room_id, &decryption_settings).await;
+        assert_let!(Ok(RoomEventDecryptionResult::Decrypted(decrypted)) = result);
+        assert_eq!(decrypted.encryption_info.session_id(), Some(group_session.session_id()));
+        decrypted.encryption_info.megolm_message_index()
+    };
+
+    // Each new message has its own index, in the order Alice encrypted them.
+    assert_eq!(decrypted_index(&event_with("$first", &ciphertexts[0])).await, Some(0));
+    assert_eq!(decrypted_index(&event_with("$third", &ciphertexts[2])).await, Some(2));
+    assert_eq!(decrypted_index(&event_with("$second", &ciphertexts[1])).await, Some(1));
+
+    // The homeserver replays the first ciphertext under a fresh event ID: the
+    // SDK decrypts it again, and the index it reports is the original's.
+    let replay = event_with("$replayed", &ciphertexts[0]);
+    assert_eq!(decrypted_index(&replay).await, Some(0));
+
+    // Info recalculated from the event keeps its ciphertext's index; info
+    // recalculated from the session alone cannot know one.
+    let recalculated = bob.get_room_event_encryption_info(&replay, room_id).await.unwrap();
+    assert_eq!(recalculated.megolm_message_index(), Some(0));
+    let second = event_with("$second", &ciphertexts[1]);
+    let recalculated = bob.get_room_event_encryption_info(&second, room_id).await.unwrap();
+    assert_eq!(recalculated.megolm_message_index(), Some(1));
+    let from_session = bob
+        .get_session_encryption_info(room_id, group_session.session_id(), alice.user_id())
+        .await
+        .unwrap();
+    assert_eq!(from_session.megolm_message_index(), None);
+}

@@ -308,6 +308,19 @@ pub enum AlgorithmInfo {
         /// if this info was stored before we collected this data.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+
+        /// The Megolm ratchet index of the ciphertext this event was
+        /// decrypted from, or None if this info was stored before we
+        /// collected this data, or was not computed from an event's
+        /// ciphertext (the info of an event this client encrypted itself, or
+        /// one recalculated from the session alone).
+        ///
+        /// A Megolm session produces each index once. Two events with
+        /// different IDs decrypted at the same `(session_id, message_index)`
+        /// are one ciphertext that a homeserver replayed: the spec asks
+        /// clients to reject the second (Filow patch 8).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<u32>,
     },
 
     /// The info if the event was encrypted using m.olm.v1.curve25519-aes-sha2
@@ -361,6 +374,26 @@ impl EncryptionInfo {
             None
         }
     }
+
+    /// The Megolm ratchet index of the ciphertext this event was decrypted
+    /// from, when known (see `AlgorithmInfo::MegolmV1AesSha2`).
+    pub fn megolm_message_index(&self) -> Option<u32> {
+        if let AlgorithmInfo::MegolmV1AesSha2 { message_index, .. } = &self.algorithm_info {
+            *message_index
+        } else {
+            None
+        }
+    }
+
+    /// Sets the Megolm ratchet index, for info recalculated from the session
+    /// alone that replaces the info an event was decrypted with: the index
+    /// belongs to the event's ciphertext, which the session cannot tell.
+    /// Does nothing for an info that is not Megolm's.
+    pub fn set_megolm_message_index(&mut self, index: Option<u32>) {
+        if let AlgorithmInfo::MegolmV1AesSha2 { message_index, .. } = &mut self.algorithm_info {
+            *message_index = index;
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for EncryptionInfo {
@@ -391,12 +424,18 @@ impl<'de> Deserialize<'de> for EncryptionInfo {
         } = Helper::deserialize(deserializer)?;
 
         let algorithm_info = match algorithm_info {
-            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, sender_claimed_keys, session_id } => {
+            AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key,
+                sender_claimed_keys,
+                session_id,
+                message_index,
+            } => {
                 AlgorithmInfo::MegolmV1AesSha2 {
                     // Migration, merge the old_session_id in algorithm_info
                     session_id: session_id.or(old_session_id),
                     curve25519_key,
                     sender_claimed_keys,
+                    message_index,
                 }
             }
             other => other,
@@ -1682,6 +1721,7 @@ mod tests {
                     curve25519_key: "xxx".to_owned(),
                     sender_claimed_keys: Default::default(),
                     session_id: Some("xyz".to_owned()),
+                    message_index: None,
                 },
                 verification_state: VerificationState::Verified,
             }),
@@ -2060,11 +2100,43 @@ mod tests {
                 (DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned()),
             ]),
             session_id: None,
+            message_index: None,
         };
 
         with_settings!({ prepend_module_to_snapshot => false }, {
             assert_json_snapshot!(info);
         });
+    }
+
+    // Filow patch 8: an info stored before the index existed loads as
+    // `None`, and the index round-trips; one without it serializes as before.
+    #[test]
+    fn test_algorithm_info_message_index_serde() {
+        let old = json!({ "MegolmV1AesSha2": {
+            "curve25519_key": "curve", "sender_claimed_keys": {}, "session_id": "s"
+        }});
+        let info: AlgorithmInfo = serde_json::from_value(old.clone()).unwrap();
+        assert_let!(AlgorithmInfo::MegolmV1AesSha2 { message_index, .. } = &info);
+        assert_eq!(*message_index, None);
+        assert_eq!(serde_json::to_value(&info).unwrap(), old);
+
+        let new = json!({ "MegolmV1AesSha2": {
+            "curve25519_key": "curve", "sender_claimed_keys": {}, "session_id": "s",
+            "message_index": 4_294_967_295u32
+        }});
+        let info: AlgorithmInfo = serde_json::from_value(new.clone()).unwrap();
+        assert_let!(AlgorithmInfo::MegolmV1AesSha2 { message_index, .. } = &info);
+        assert_eq!(*message_index, Some(u32::MAX));
+        assert_eq!(serde_json::to_value(&info).unwrap(), new);
+
+        let mut encryption_info: EncryptionInfo = serde_json::from_value(json!({
+            "sender": "@alice:localhost", "sender_device": "ABCDEFGH",
+            "algorithm_info": new, "verification_state": "Verified",
+        }))
+        .unwrap();
+        assert_eq!(encryption_info.megolm_message_index(), Some(u32::MAX));
+        encryption_info.set_megolm_message_index(Some(7));
+        assert_eq!(encryption_info.megolm_message_index(), Some(7));
     }
 
     #[test]
@@ -2105,6 +2177,7 @@ mod tests {
                 curve25519_key: "curvecurvecurve".into(),
                 sender_claimed_keys: Default::default(),
                 session_id: Some("mysessionid76".to_owned()),
+                message_index: None,
             },
             verification_state: VerificationState::Verified,
         };
@@ -2135,6 +2208,7 @@ mod tests {
                         ),
                     ]),
                     session_id: Some("mysessionid112".to_owned()),
+                    message_index: None,
                 },
                 verification_state: VerificationState::Verified,
             }),

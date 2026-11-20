@@ -188,6 +188,7 @@ async fn test_live_location_no_sent_in_clear_shield() {
             curve25519_key: "fake_key".to_owned(),
             sender_claimed_keys: BTreeMap::new(),
             session_id: Some("fake_session".to_owned()),
+            message_index: None,
         },
         verification_state: VerificationState::Verified,
     });

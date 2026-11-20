@@ -181,6 +181,7 @@ async fn test_edit_updates_encryption_info() {
             curve25519_key: "123".to_owned(),
             sender_claimed_keys: BTreeMap::new(),
             session_id: Some("mysessionid6333".to_owned()),
+            message_index: None,
         },
         verification_state: VerificationState::Verified,
     });

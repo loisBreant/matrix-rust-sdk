@@ -129,6 +129,7 @@ fn test_edit_validity_replacement_is_not_encrypted() {
             curve25519_key: "1337".to_owned(),
             sender_claimed_keys: Default::default(),
             session_id: Some("mysessionid9".to_owned()),
+            message_index: None,
         },
         verification_state: VerificationState::Verified,
     });
@@ -162,6 +163,7 @@ fn test_edit_validity_replacement_is_missing_new_content() {
             curve25519_key: "1337".to_owned(),
             sender_claimed_keys: Default::default(),
             session_id: Some("mysessionid9".to_owned()),
+            message_index: None,
         },
         verification_state: VerificationState::Verified,
     });

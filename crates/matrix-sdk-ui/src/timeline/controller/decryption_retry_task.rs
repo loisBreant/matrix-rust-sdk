@@ -304,6 +304,7 @@ mod tests {
                     curve25519_key: "".to_owned(),
                     sender_claimed_keys: BTreeMap::new(),
                     session_id: Some(session_id.to_owned()),
+                    message_index: None,
                 },
                 verification_state: VerificationState::Verified,
             })),

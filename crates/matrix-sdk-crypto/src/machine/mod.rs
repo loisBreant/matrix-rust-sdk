@@ -1258,6 +1258,9 @@ impl OlmMachine {
                     identity_keys.ed25519.to_base64(),
                 )]),
                 session_id: Some(session_id),
+                // Known to the session that encrypted it, but no reader of
+                // this info needs it: Filow dedupes received events only.
+                message_index: None,
             },
             EventEncryptionAlgorithm::OlmV1Curve25519AesSha2 => {
                 AlgorithmInfo::OlmV1Curve25519AesSha2 {
@@ -2283,10 +2286,14 @@ impl OlmMachine {
     /// This includes the session owner's Matrix user ID, their device ID, info
     /// regarding the cryptographic algorithm and whether the session, and by
     /// extension the events decrypted by the session, are trusted.
+    ///
+    /// `message_index` is the ratchet index of the ciphertext the info is for,
+    /// when there is one (Filow patch 8).
     async fn get_encryption_info(
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
+        message_index: Option<u32>,
     ) -> MegolmResult<Arc<EncryptionInfo>> {
         let (verification_state, device_id) =
             self.get_room_event_verification_state(session, sender).await?;
@@ -2311,6 +2318,7 @@ impl OlmMachine {
                     .map(|(k, v)| (k.to_owned(), v.to_base64()))
                     .collect(),
                 session_id: Some(session.session_id().to_owned()),
+                message_index,
             },
             verification_state,
         }))
@@ -2335,8 +2343,9 @@ impl OlmMachine {
 
         let result = session.decrypt(event).await;
         match result {
-            Ok((decrypted_event, _)) => {
-                let encryption_info = self.get_encryption_info(&session, &event.sender).await?;
+            Ok((decrypted_event, message_index)) => {
+                let encryption_info =
+                    self.get_encryption_info(&session, &event.sender, Some(message_index)).await?;
 
                 self.check_sender_trust_requirement(
                     &session,
@@ -2823,7 +2832,8 @@ impl OlmMachine {
             .record("event_id", debug(&event.event_id))
             .record("session_id", content.session_id());
 
-        self.get_session_encryption_info(room_id, content.session_id(), &event.sender).await
+        let session = self.get_inbound_group_session_or_error(room_id, content.session_id()).await?;
+        self.get_encryption_info(&session, &event.sender, Some(content.message_index())).await
     }
 
     /// Get encryption info for an event decrypted with a megolm session.
@@ -2847,7 +2857,7 @@ impl OlmMachine {
         sender: &UserId,
     ) -> MegolmResult<Arc<EncryptionInfo>> {
         let session = self.get_inbound_group_session_or_error(room_id, session_id).await?;
-        self.get_encryption_info(&session, sender).await
+        self.get_encryption_info(&session, sender, None).await
     }
 
     /// Update the list of tracked users.

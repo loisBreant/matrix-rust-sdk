@@ -935,6 +935,7 @@ impl OlmMachine {
                 curve25519_key,
                 sender_claimed_keys,
                 session_id: _,
+                message_index: _,
             } => DecryptedEvent {
                 clear_event: serde_json::to_string(&event_json)?,
                 sender_curve25519_key: curve25519_key.to_owned(),

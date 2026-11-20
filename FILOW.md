@@ -11,7 +11,8 @@ https://github.com/loisBreant/Filow/issues/537 (patch 2),
 https://github.com/loisBreant/Filow/issues/1560 (patch 3),
 https://github.com/loisBreant/Filow/issues/1685 (patches 4 and 5),
 https://github.com/loisBreant/Filow/issues/1691 (patch 6),
-https://github.com/loisBreant/Filow/issues/1762 (patch 7)
+https://github.com/loisBreant/Filow/issues/1762 (patch 7),
+https://github.com/loisBreant/Filow/issues/223 (patch 8)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -454,6 +455,55 @@ device inside the send's check and are red without the binding. Filow
 also holds one checked send at a time per room in its process, so the
 binding in place during a share is that send's own, and fetches the full
 member list before its check judges it.
+
+## Patch 8: report the Megolm ratchet index a room event was decrypted at
+
+`crates/matrix-sdk-common/src/deserialized_responses.rs`,
+`crates/matrix-sdk-crypto/src/machine/mod.rs` and
+`crates/matrix-sdk/src/event_cache/redecryptor.rs`, additive apart from the
+new field:
+
+- `AlgorithmInfo::MegolmV1AesSha2` gains `message_index: Option<u32>`
+  (`#[serde(default, skip_serializing_if = "Option::is_none")]`, so an info
+  stored before it loads as `None` and one without it serializes as before),
+  with `EncryptionInfo::megolm_message_index()` and
+  `set_megolm_message_index()`.
+- `OlmMachine::decrypt_room_event` fills it with the index vodozemac
+  decrypted the ciphertext at (`InboundGroupSession::decrypt` already
+  returned it; upstream dropped it). `get_room_event_encryption_info` fills
+  it from the event's ciphertext. `get_session_encryption_info`, which has
+  no event, and the info of an event this client encrypted itself leave it
+  `None`.
+- The event cache's redecryptor, which replaces an event's info with one
+  recalculated from the session alone after a device or identity change,
+  keeps the index the event was decrypted at.
+
+### Why Filow needs it
+
+A homeserver relays Megolm ciphertext it cannot read but can resend: the
+same ciphertext under a fresh event ID (or a later timestamp) decrypts
+again, and a client shows the message, reaction or vote twice. The spec
+(Client-Server API, `m.megolm.v1.aes-sha2`) asks clients to keep track of
+the ratchet indices they decrypted and reject a second event at one index,
+while the same event may be decrypted twice. matrix-js-sdk does
+(element-web#25108); matrix-rust-sdk does not (matrix-org/matrix-rust-sdk#1960),
+and the index never left `decrypt_room_event`. Without it a client cannot
+tell a replay from a second message that says the same thing. Filow keeps
+one event per `(room, session, index)` and one index per event ID in its
+store (Filow #223, `client_core/src/storage/megolm_indices.rs`).
+
+Tests: `test_decrypted_event_reports_its_megolm_message_index` in
+`crates/matrix-sdk-crypto/src/machine/tests/mod.rs` (three messages at
+indices 0 to 2, a replay of the first under another event ID reported at
+0, the info recalculated from an event and from the session alone);
+`test_redecryptor_updating_encryption_info` in
+`crates/matrix-sdk/src/event_cache/redecryptor.rs` checks the index
+survives the info's update; `test_algorithm_info_message_index_serde` in
+`deserialized_responses.rs` checks the field's old and new forms. In
+Filow, `client_core/src/matrix/trust.rs`'s
+`a_replayed_megolm_message_or_reaction_is_stored_once` replays a real
+Megolm ciphertext under fresh event IDs through a sync and is red without
+the patch.
 
 ## Dependency bump: rusqlite 0.42.0
 

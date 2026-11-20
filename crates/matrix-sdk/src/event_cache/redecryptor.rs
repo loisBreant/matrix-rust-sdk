@@ -117,7 +117,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     pin::Pin,
-    sync::Weak,
+    sync::{Arc, Weak},
 };
 
 use as_variant::as_variant;
@@ -746,8 +746,21 @@ impl EventCache {
 
         for (event_id, mut event) in events {
             if let Some(session_id) = event.encryption_info.session_id() {
-                let new_encryption_info =
-                    room.get_encryption_info(session_id, &event.encryption_info.sender).await;
+                // Recalculated from the session alone, the info cannot know
+                // the ratchet index of this event's ciphertext: it keeps the
+                // one the event was decrypted at (Filow patch 8), or a
+                // replay check reading it would see no index after a device
+                // update.
+                let new_encryption_info = room
+                    .get_encryption_info(session_id, &event.encryption_info.sender)
+                    .await
+                    .map(|info| {
+                        let mut info = Arc::unwrap_or_clone(info);
+                        info.set_megolm_message_index(
+                            event.encryption_info.megolm_message_index(),
+                        );
+                        Arc::new(info)
+                    });
 
                 // Only create a replacement if the encryption info actually changed.
                 if let Some(new_encryption_info) = new_encryption_info
@@ -1785,6 +1798,9 @@ mod tests {
 
         let encryption_info = value.encryption_info().unwrap();
         assert_matches!(&encryption_info.verification_state, VerificationState::Unverified(_));
+        // Filow patch 8: decrypted at its ciphertext's ratchet index.
+        let message_index = encryption_info.megolm_message_index();
+        assert!(message_index.is_some(), "a decrypted event knows its Megolm index");
 
         assert_let_timeout!(
             Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) = generic_stream.recv()
@@ -1835,6 +1851,9 @@ mod tests {
             VerificationState::Unverified(_),
             "The event should now know about the identity but still be unverified"
         );
+        // Info recalculated from the session alone keeps the index the event
+        // was decrypted at (Filow patch 8).
+        assert_eq!(encryption_info.megolm_message_index(), message_index);
 
         assert_let_timeout!(
             Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) = generic_stream.recv()

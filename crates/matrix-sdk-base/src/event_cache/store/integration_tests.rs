@@ -87,6 +87,7 @@ pub fn make_test_event_with_event_id(
             curve25519_key: "1337".to_owned(),
             sender_claimed_keys: Default::default(),
             session_id: Some("mysessionid9".to_owned()),
+            message_index: None,
         },
         verification_state: VerificationState::Verified,
     });
