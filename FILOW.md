@@ -10,7 +10,8 @@ Tracking issues: https://github.com/loisBreant/Filow/issues/106 (patch 1),
 https://github.com/loisBreant/Filow/issues/537 (patch 2),
 https://github.com/loisBreant/Filow/issues/1560 (patch 3),
 https://github.com/loisBreant/Filow/issues/1685 (patches 4 and 5),
-https://github.com/loisBreant/Filow/issues/1691 (patch 6)
+https://github.com/loisBreant/Filow/issues/1691 (patch 6),
+https://github.com/loisBreant/Filow/issues/1762 (patch 7)
 
 ## Patch 1: encrypt reactions in encrypted rooms
 
@@ -369,6 +370,90 @@ key and sends no room key, not even after a sync, until released). In
 Filow, `a_restarted_device_backs_no_room_key_up_before_its_check`
 (`client_core/src/key_backup/cross_signing_tests.rs`) is red without the
 hold.
+
+## Patch 7: bind a room's key to the recipients a client checked
+
+`crates/matrix-sdk-crypto/src/session_manager/group_sessions/`
+(`recipient_binding.rs`, `share_strategy.rs`, `mod.rs`),
+`crates/matrix-sdk-crypto/src/machine/mod.rs`,
+`crates/matrix-sdk-base/src/client.rs` and `crates/matrix-sdk/src/room/`
+(`mod.rs`, `futures.rs`), `crates/matrix-sdk/src/error.rs`, additive:
+
+- `RoomKeyRecipientBinding` (matrix-sdk-crypto, re-exported as
+  `matrix_sdk::crypto::RoomKeyRecipientBinding`): the users a room key may
+  go to, each with any device the share strategy picks (`allow_user`) or
+  only the devices named (`allow_devices`). An empty binding permits no
+  one; a user it does not name gets nothing.
+- `Room::bind_room_key_recipients(binding)` (and
+  `BaseClient::bind_room_key_recipients`, `room_key_recipient_binding`):
+  from then on, until the next call for the room replaces it, the room's
+  key goes only to what the binding permits, whatever the member list says
+  when the key is shared. Kept in `BaseClient` memory, shared with
+  `clone_with_in_memory_state_store` copies, with no way back to unbound
+  for as long as the client lives.
+- `BaseClient::room_key_recipient_users`, the one list patch 3 introduced
+  for the share, the one-time-key claim and the key query, keeps only the
+  users the binding permits. `BaseClient::share_room_key` reads the binding
+  inside the share and calls the new `OlmMachine::share_room_key_bound`,
+  whose recipient collection (`collect_session_recipients_bound`) drops the
+  users and devices the binding leaves out before the oversharing check:
+  a session one of them holds is rotated, as for a member who left. A user
+  left out is sent nothing, not even a withheld notice; a device left out
+  that the strategy would have keyed gets no withheld notice either, while
+  one the strategy itself refuses still gets the strategy's notice, as
+  upstream sends it.
+- `Room::send`/`send_raw` (`room/futures.rs`), in a bound room, check after
+  encrypting that the session used is still the room's, not invalidated,
+  and shared (sent or pending) with no device outside the binding in place
+  (`OlmMachine::room_key_shared_within`); if not, it is discarded, the key
+  shared again and the event encrypted again, once; a second failure is
+  `Error::RoomKeySharedBeyondBoundRecipients` and nothing is sent. This is
+  patch 3's check, generalised, and sound for the same reasons (one
+  `Client`'s `group_session_deduplicated_handler`): a send whose share
+  joined one started under an earlier binding would otherwise encrypt under
+  a session that binding gave to someone the later check left out. In a
+  room both marked (patch 3) and bound, both checks apply, and the users are
+  the own user if the binding permits them.
+- Upstream behaviour is unchanged in a room never bound:
+  `OlmMachine::share_room_key` and `collect_session_recipients` are the
+  bound versions with no binding.
+
+### Why Filow needs it
+
+Filow checks a room's members before every send: the own devices against
+the account's allowlist, every bridge bot against its pin, and a launcher
+bridge's conversation refused when it names another bridge bot (Filow
+#1235). matrix-sdk then reads the members again, inside `send_raw`, when
+it shares the room key, and a homeserver can land a member in between: a
+managed bot this device trusts from its pin joined to a launcher portal, a
+retired launcher bot the account's signature still makes the SDK trust, or
+an own device the allowlist does not name (Filow #1762, review finding M2
+of Filow #1235). The strategy is client-wide and the members are read
+inside the SDK, so neither can be narrowed from outside; upstream `main`
+has no per-room or per-send recipient control (`BaseClient::share_room_key`
+reads `get_user_ids` with the client's strategy). Filow binds the room's
+key, after each check passes, to the members the check read and, for the
+own user, to the devices the allowlist names.
+
+Tests: `test_binding_permits_only_what_it_names` in
+`recipient_binding.rs`; `test_bound_sharing_keys_only_what_the_binding_permits`
+and `test_bound_sharing_sends_nothing_to_a_user_left_out` in
+`group_sessions/mod.rs`; `test_room_key_recipients_bound_to_a_checked_member_list`
+in `crates/matrix-sdk-base/src/client.rs`; in
+`crates/matrix-sdk/tests/integration/encryption/bound_room_key_recipients.rs`,
+a member who joined after the binding and a device a bound user gained
+after it get no key (with unbound and rebound controls that key them), a
+session shared before the binding or with a device it leaves out is
+rotated, a share running under an earlier binding never encrypts an event
+sent under a later one, and a send that finds no bound key twice sends
+nothing. In Filow, `client_core/src/matrix/send.rs`'s
+`a_managed_bot_landed_in_a_launcher_portal_mid_send_gets_no_room_key`,
+`a_retired_launcher_bot_landed_mid_send_gets_no_room_key` and
+`an_own_device_published_mid_send_gets_no_room_key` land the member or the
+device inside the send's check and are red without the binding. Filow
+also holds one checked send at a time per room, so the binding in place
+during a share is that send's own, and fetches the full member list before
+its check judges it.
 
 ## Dependency bump: rusqlite 0.42.0
 

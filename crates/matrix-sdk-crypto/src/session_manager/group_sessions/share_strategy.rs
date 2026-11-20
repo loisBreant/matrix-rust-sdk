@@ -23,7 +23,7 @@ use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, trace};
 
-use super::OutboundGroupSession;
+use super::{OutboundGroupSession, RoomKeyRecipientBinding};
 #[cfg(feature = "experimental-x509-identity-verification")]
 use crate::x509::X509Verifier;
 #[cfg(doc)]
@@ -178,18 +178,35 @@ pub(crate) struct CollectRecipientsResult {
 /// Returns information indicating whether the session needs to be rotated
 /// and the list of users/devices that should receive or not the session
 /// (with withheld reason).
-#[instrument(skip_all)]
+// Filow patch 7: the share goes through `collect_session_recipients_bound`.
+#[cfg(test)]
 pub(crate) async fn collect_session_recipients(
     store: &Store,
     users: impl Iterator<Item = &UserId>,
     settings: &EncryptionSettings,
     outbound: &OutboundGroupSession,
 ) -> OlmResult<CollectRecipientsResult> {
-    let mut result = collect_recipients_for_share_strategy(
+    collect_session_recipients_bound(store, users, settings, outbound, None).await
+}
+
+/// `collect_session_recipients`, keeping only the users and devices
+/// `binding` permits, when there is one (Filow patch 7): the others are left
+/// out as if they were not in the room, so a session one of them holds is
+/// rotated.
+#[instrument(skip_all)]
+pub(crate) async fn collect_session_recipients_bound(
+    store: &Store,
+    users: impl Iterator<Item = &UserId>,
+    settings: &EncryptionSettings,
+    outbound: &OutboundGroupSession,
+    binding: Option<&RoomKeyRecipientBinding>,
+) -> OlmResult<CollectRecipientsResult> {
+    let mut result = collect_recipients_for_share_strategy_bound(
         store,
         users,
         &settings.sharing_strategy,
         Some(outbound),
+        binding,
     )
     .await?;
 
@@ -234,7 +251,22 @@ pub(crate) async fn collect_recipients_for_share_strategy(
     share_strategy: &CollectStrategy,
     outbound: Option<&OutboundGroupSession>,
 ) -> OlmResult<CollectRecipientsResult> {
-    let users: BTreeSet<&UserId> = users.collect();
+    collect_recipients_for_share_strategy_bound(store, users, share_strategy, outbound, None).await
+}
+
+/// [`collect_recipients_for_share_strategy`] within `binding`, when there is
+/// one (Filow patch 7).
+async fn collect_recipients_for_share_strategy_bound(
+    store: &Store,
+    users: impl Iterator<Item = &UserId>,
+    share_strategy: &CollectStrategy,
+    outbound: Option<&OutboundGroupSession>,
+    binding: Option<&RoomKeyRecipientBinding>,
+) -> OlmResult<CollectRecipientsResult> {
+    // Filow patch 7: a user the binding does not permit is not a recipient,
+    // whatever the member list says.
+    let users: BTreeSet<&UserId> =
+        users.filter(|user| binding.is_none_or(|binding| binding.permits_user(user))).collect();
     trace!(?users, ?share_strategy, "Calculating group session recipients");
 
     let mut result = CollectRecipientsResult::default();
@@ -270,7 +302,13 @@ pub(crate) async fn collect_recipients_for_share_strategy(
                     #[cfg(feature = "experimental-x509-identity-verification")]
                     store.x509_verifier(),
                 );
-                update_recipients_for_user(&mut result, outbound, user_id, recipient_devices);
+                update_recipients_for_user(
+                    &mut result,
+                    outbound,
+                    user_id,
+                    recipient_devices,
+                    binding,
+                );
             }
         }
         CollectStrategy::ErrorOnVerifiedUserProblem => {
@@ -316,6 +354,7 @@ pub(crate) async fn collect_recipients_for_share_strategy(
                             outbound,
                             user_id,
                             recipient_devices,
+                            binding,
                         );
                     }
                 }
@@ -374,7 +413,13 @@ pub(crate) async fn collect_recipients_for_share_strategy(
                     &device_owner_identity,
                 );
 
-                update_recipients_for_user(&mut result, outbound, user_id, recipient_devices);
+                update_recipients_for_user(
+                    &mut result,
+                    outbound,
+                    user_id,
+                    recipient_devices,
+                    binding,
+                );
             }
         }
 
@@ -395,7 +440,13 @@ pub(crate) async fn collect_recipients_for_share_strategy(
                     store.x509_verifier(),
                 );
 
-                update_recipients_for_user(&mut result, outbound, user_id, recipient_devices);
+                update_recipients_for_user(
+                    &mut result,
+                    outbound,
+                    user_id,
+                    recipient_devices,
+                    binding,
+                );
             }
         }
     }
@@ -421,8 +472,20 @@ fn update_recipients_for_user(
     recipients: &mut CollectRecipientsResult,
     outbound: Option<&OutboundGroupSession>,
     user_id: &UserId,
-    recipient_devices: RecipientDevicesForUser,
+    mut recipient_devices: RecipientDevicesForUser,
+    binding: Option<&RoomKeyRecipientBinding>,
 ) {
+    // Filow patch 7: a device the binding does not permit is not a
+    // recipient. It is left out before the oversharing check, so a session
+    // it holds is rotated; it gets no withheld notice, as for a device the
+    // client does not know. A device the strategy itself refuses keeps the
+    // strategy's notice.
+    if let Some(binding) = binding {
+        recipient_devices
+            .allowed_devices
+            .retain(|device| binding.permits_device(user_id, device.device_id()));
+    }
+
     // If we haven't already concluded that the session should be
     // rotated for other reasons, we also need to check whether any
     // of the devices in the session got deleted or blacklisted in the

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod recipient_binding;
 mod share_strategy;
 
 use std::{
@@ -27,6 +28,7 @@ use itertools::Itertools;
 use matrix_sdk_common::{
     deserialized_responses::WithheldCode, executor::spawn, locks::RwLock as StdRwLock,
 };
+pub use recipient_binding::RoomKeyRecipientBinding;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use ruma::events::AnyStateEventContent;
 use ruma::{
@@ -205,6 +207,26 @@ impl GroupSessionManager {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Whether the room's outbound session holds as one only what `binding`
+    /// permits can have: it exists, is `session_id`, is not invalidated, and
+    /// every device it was shared with, or is being shared with (requests
+    /// not sent yet), is one `binding` permits (Filow patch 7).
+    pub async fn room_key_shared_within(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        binding: &RoomKeyRecipientBinding,
+    ) -> bool {
+        let Some(session) = self.sessions.get_or_load(room_id).await else {
+            return false;
+        };
+        session.session_id() == session_id
+            && !session.invalidated()
+            && session.sharing_view().iter_shares(None, None).all(|(user_id, device_id, info)| {
+                matches!(info, ShareInfo::Withheld(_)) || binding.permits_device(user_id, device_id)
+            })
     }
 
     fn shared_only_with(session: &OutboundGroupSession, user_id: &UserId) -> bool {
@@ -424,6 +446,8 @@ impl GroupSessionManager {
     /// Returns information indicating whether the session needs to be rotated
     /// and the list of users/devices that should receive or not the session
     /// (with withheld reason).
+    // Filow patch 7: `share_room_key_bound` collects within its binding.
+    #[cfg(test)]
     #[instrument(skip_all)]
     pub async fn collect_session_recipients(
         &self,
@@ -716,12 +740,25 @@ impl GroupSessionManager {
     ///
     /// `encryption_settings` - The settings that should be used for
     /// the room key.
-    #[instrument(skip(self, users, encryption_settings), fields(session_id))]
     pub async fn share_room_key(
         &self,
         room_id: &RoomId,
         users: impl Iterator<Item = &UserId>,
         encryption_settings: impl Into<EncryptionSettings>,
+    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
+        self.share_room_key_bound(room_id, users, encryption_settings, None).await
+    }
+
+    /// [`GroupSessionManager::share_room_key`], sharing only with the users
+    /// and devices `binding` permits when there is one (Filow patch 7): a
+    /// session someone else holds is rotated first.
+    #[instrument(skip(self, users, encryption_settings, binding), fields(session_id))]
+    pub async fn share_room_key_bound(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        binding: Option<&RoomKeyRecipientBinding>,
     ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
         trace!("Checking if a room key needs to be shared");
 
@@ -768,7 +805,14 @@ impl GroupSessionManager {
         // or the recipient list changed in a way that requires the
         // session to be rotated.
         let CollectRecipientsResult { should_rotate, devices, mut withheld_devices } =
-            self.collect_session_recipients(users, &encryption_settings, &outbound).await?;
+            share_strategy::collect_session_recipients_bound(
+                &self.store,
+                users,
+                &encryption_settings,
+                &outbound,
+                binding,
+            )
+            .await?;
 
         let outbound = self
             .maybe_rotate_group_session(
@@ -1130,7 +1174,7 @@ mod tests {
     use matrix_sdk_common::deserialized_responses::{ProcessedToDeviceEvent, WithheldCode};
     use matrix_sdk_test::{async_test, ruma_response_from_json};
     use ruma::{
-        DeviceId, OneTimeKeyAlgorithm, OwnedMxcUri, TransactionId, UInt, UserId,
+        DeviceId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedMxcUri, TransactionId, UInt, UserId,
         api::client::{
             keys::{claim_keys, get_keys, upload_keys},
             to_device::send_event_to_device::v3::Response as ToDeviceResponse,
@@ -1144,7 +1188,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, TrustRequirement,
+        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, RoomKeyRecipientBinding,
+        TrustRequirement,
         identities::DeviceData,
         machine::{
             EncryptionSyncChanges, test_helpers::get_machine_pair_with_setup_sessions_test_helper,
@@ -1346,6 +1391,144 @@ mod tests {
                 count
             })
             .sum()
+    }
+
+    /// The `user|device` pairs the room-key requests of `requests` address.
+    fn keyed_devices(requests: &[Arc<ToDeviceRequest>]) -> BTreeSet<String> {
+        requests
+            .iter()
+            .filter(|r| r.event_type == "m.room.encrypted".into())
+            .flat_map(|r| {
+                r.messages.iter().flat_map(|(user, devices)| {
+                    devices.keys().map(move |device| format!("{user}|{device}"))
+                })
+            })
+            .collect()
+    }
+
+    // Filow patch 7: a bound share keys only the users and devices the
+    // binding permits, and rotates a session one it leaves out holds.
+    #[async_test]
+    async fn test_bound_sharing_keys_only_what_the_binding_permits() {
+        let machine = machine().await;
+        let room_id = room_id!("!test:localhost");
+        let example = user_id!("@example:localhost");
+        let bob = user_id!("@bob:localhost");
+        let users = [example, bob];
+
+        // Bound to Bob alone: no device of @example is keyed, though it is
+        // named as a member.
+        let mut bob_only = RoomKeyRecipientBinding::new();
+        bob_only.allow_user(bob.to_owned());
+        let requests = machine
+            .share_room_key_bound(
+                room_id,
+                users.iter().copied(),
+                EncryptionSettings::default(),
+                &bob_only,
+            )
+            .await
+            .unwrap();
+        let keyed = keyed_devices(&requests);
+        assert!(keyed.iter().any(|r| r.starts_with("@bob:localhost|")), "{keyed:?}");
+        assert!(!keyed.iter().any(|r| r.starts_with("@example:localhost|")), "{keyed:?}");
+        for request in &requests {
+            machine.mark_request_as_sent(&request.txn_id, &ToDeviceResponse::new()).await.unwrap();
+        }
+        let first = machine
+            .inner
+            .group_session_manager
+            .get_outbound_group_session(room_id)
+            .unwrap()
+            .session_id()
+            .to_owned();
+        assert!(machine.room_key_shared_within(room_id, &first, &bob_only).await);
+
+        // One device of @example only: that device is keyed, no other one,
+        // and the session is the same (no one was left out).
+        let all = machine
+            .share_room_key(room_id, users.iter().copied(), EncryptionSettings::default())
+            .await
+            .unwrap();
+        let example_device = keyed_devices(&all)
+            .into_iter()
+            .find_map(|r| r.strip_prefix("@example:localhost|").map(ToOwned::to_owned))
+            .expect("a device of @example");
+        for request in &all {
+            machine.mark_request_as_sent(&request.txn_id, &ToDeviceResponse::new()).await.unwrap();
+        }
+        let second = machine
+            .inner
+            .group_session_manager
+            .get_outbound_group_session(room_id)
+            .unwrap()
+            .session_id()
+            .to_owned();
+        assert_eq!(second, first, "the unbound share rotated");
+        assert!(!machine.room_key_shared_within(room_id, &second, &bob_only).await);
+        let mut one_device = bob_only.clone();
+        one_device
+            .allow_devices(example.to_owned(), [OwnedDeviceId::from(example_device.as_str())]);
+        assert!(!machine.room_key_shared_within(room_id, &second, &one_device).await);
+
+        // The unbound share gave the session to every device of @example:
+        // bound to one of them, the session is rotated and only that one
+        // device of @example is keyed.
+        let requests = machine
+            .share_room_key_bound(
+                room_id,
+                users.iter().copied(),
+                EncryptionSettings::default(),
+                &one_device,
+            )
+            .await
+            .unwrap();
+        let third = machine
+            .inner
+            .group_session_manager
+            .get_outbound_group_session(room_id)
+            .unwrap()
+            .session_id()
+            .to_owned();
+        assert_ne!(third, second, "a session devices left out hold was kept");
+        let keyed = keyed_devices(&requests);
+        let example_keyed: Vec<_> =
+            keyed.iter().filter(|r| r.starts_with("@example:localhost|")).collect();
+        assert_eq!(example_keyed, vec![&format!("@example:localhost|{example_device}")]);
+        assert!(machine.room_key_shared_within(room_id, &third, &one_device).await);
+        assert!(!machine.room_key_shared_within(room_id, &third, &bob_only).await);
+        assert!(!machine.room_key_shared_within(room_id, "another", &one_device).await);
+    }
+
+    // Filow patch 7: a user the binding leaves out is no recipient at all,
+    // not even of a withheld notice the share strategy would send it.
+    #[async_test]
+    async fn test_bound_sharing_sends_nothing_to_a_user_left_out() {
+        let machine = machine().await;
+        let room_id = room_id!("!test:localhost");
+        let users = [user_id!("@example:localhost"), user_id!("@bob:localhost")];
+        let settings = EncryptionSettings {
+            sharing_strategy: CollectStrategy::OnlyTrustedDevices,
+            ..Default::default()
+        };
+        let addressed = |requests: &[Arc<ToDeviceRequest>]| -> BTreeSet<String> {
+            requests.iter().flat_map(|r| r.messages.keys().map(|u| u.to_string())).collect()
+        };
+
+        // The control: unbound, the strategy tells @example's unverified
+        // devices that the key is withheld.
+        let unbound =
+            machine.share_room_key(room_id, users.iter().copied(), settings.clone()).await.unwrap();
+        assert!(addressed(&unbound).contains("@example:localhost"));
+        machine.discard_room_key(room_id).await.unwrap();
+
+        let mut bob_only = RoomKeyRecipientBinding::new();
+        bob_only.allow_user(users[1].to_owned());
+        let bound = machine
+            .share_room_key_bound(room_id, users.iter().copied(), settings, &bob_only)
+            .await
+            .unwrap();
+        assert!(!addressed(&bound).contains("@example:localhost"), "{:?}", addressed(&bound));
     }
 
     #[async_test]

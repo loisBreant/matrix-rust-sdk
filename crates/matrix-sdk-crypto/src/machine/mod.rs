@@ -74,7 +74,7 @@ use crate::session_manager::split_devices_for_share_strategy;
 use crate::x509::{RawX509Signer, RawX509Verifier, X509Signer, X509Verifier};
 use crate::{
     CollectStrategy, CryptoStoreError, DecryptionSettings, DeviceData, LocalTrust,
-    RoomEventDecryptionResult, SignatureError, TrustRequirement,
+    RoomEventDecryptionResult, RoomKeyRecipientBinding, SignatureError, TrustRequirement,
     backups::{BackupMachine, MegolmV1BackupKey},
     dehydrated_devices::{DehydratedDevices, DehydrationError},
     error::{EventError, MegolmError, MegolmResult, OlmError, OlmResult, SetRoomSettingsError},
@@ -1406,6 +1406,36 @@ impl OlmMachine {
         encryption_settings: impl Into<EncryptionSettings>,
     ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
         self.inner.group_session_manager.share_room_key(room_id, users, encryption_settings).await
+    }
+
+    /// [`OlmMachine::share_room_key`], sharing only with the users and
+    /// devices `binding` permits (Filow patch 7): a user or device it leaves
+    /// out is treated as one that is not in the room, so a session one of
+    /// them holds is rotated before the key is shared.
+    pub async fn share_room_key_bound(
+        &self,
+        room_id: &RoomId,
+        users: impl Iterator<Item = &UserId>,
+        encryption_settings: impl Into<EncryptionSettings>,
+        binding: &RoomKeyRecipientBinding,
+    ) -> OlmResult<Vec<Arc<ToDeviceRequest>>> {
+        self.inner
+            .group_session_manager
+            .share_room_key_bound(room_id, users, encryption_settings, Some(binding))
+            .await
+    }
+
+    /// Whether the outbound room key of `room_id` holds as one only what
+    /// `binding` permits can have (Filow patch 7): it is `session_id`, is not
+    /// invalidated, and every device that received it or has a request
+    /// pending to receive it is one `binding` permits.
+    pub async fn room_key_shared_within(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        binding: &RoomKeyRecipientBinding,
+    ) -> bool {
+        self.inner.group_session_manager.room_key_shared_within(room_id, session_id, binding).await
     }
 
     /// Encrypts the given content using Olm for each of the given devices.

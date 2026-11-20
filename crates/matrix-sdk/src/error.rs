@@ -411,6 +411,12 @@ pub enum Error {
     /// sent.
     #[error("the room key reached someone other than the own user")]
     RoomKeySharedBeyondOwnUser,
+
+    /// A room whose keys are bound to the recipients a client checked
+    /// (`Room::bind_room_key_recipients`, Filow patch 7) still had no room
+    /// key only they hold after it was rotated once; nothing was sent.
+    #[error("the room key reached someone the room's binding leaves out")]
+    RoomKeySharedBeyondBoundRecipients,
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines

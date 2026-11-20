@@ -229,15 +229,44 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                 // still have given the session to another member; it is
                 // checked after encrypting (a session shared later only
                 // carries later messages), then rotated once.
-                if room.client.base_client().room_keys_shared_only_with_own_user(room.room_id()) {
+                //
+                // Filow patch 7: in a room whose keys are bound to the
+                // recipients a client checked, the same holds for the
+                // binding: a share the send joined through the deduplicated
+                // handler can have read an earlier binding.
+                let own_user_only =
+                    room.client.base_client().room_keys_shared_only_with_own_user(room.room_id());
+                let bound =
+                    room.client.base_client().room_key_recipient_binding(room.room_id()).is_some();
+                if own_user_only || bound {
                     for attempt in 0..2 {
                         let guard = room.client.olm_machine().await;
                         let olm = guard.as_ref().expect("Olm machine wasn't started");
+                        // The binding in place now, which a share that
+                        // started after this send's own call to bind honours.
+                        let binding =
+                            room.client.base_client().room_key_recipient_binding(room.room_id());
                         // A result without a Megolm session id fails the check.
                         let holds = match result.encryption_info.session_id() {
                             Some(session_id) => {
-                                olm.room_key_shared_only_with_own_user(room.room_id(), session_id)
-                                    .await
+                                (!own_user_only
+                                    || olm
+                                        .room_key_shared_only_with_own_user(
+                                            room.room_id(),
+                                            session_id,
+                                        )
+                                        .await)
+                                    && match &binding {
+                                        Some(binding) => {
+                                            olm.room_key_shared_within(
+                                                room.room_id(),
+                                                session_id,
+                                                binding,
+                                            )
+                                            .await
+                                        }
+                                        None => true,
+                                    }
                             }
                             None => false,
                         };
@@ -245,7 +274,11 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                             break;
                         }
                         if attempt == 1 {
-                            return Err(crate::Error::RoomKeySharedBeyondOwnUser);
+                            return Err(if own_user_only {
+                                crate::Error::RoomKeySharedBeyondOwnUser
+                            } else {
+                                crate::Error::RoomKeySharedBeyondBoundRecipients
+                            });
                         }
                         olm.discard_room_key(room.room_id()).await?;
                         drop(guard);

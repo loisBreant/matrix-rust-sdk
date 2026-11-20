@@ -123,8 +123,8 @@ pub mod verification;
 use matrix_sdk_base::crypto::OlmMachineBuilder;
 pub use matrix_sdk_base::crypto::{
     CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, KeyExportError, LocalTrust,
-    MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SessionCreationError,
-    SignatureError, VERSION,
+    MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, RoomKeyRecipientBinding,
+    SessionCreationError, SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,

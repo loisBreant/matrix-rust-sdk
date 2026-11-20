@@ -1,4 +1,5 @@
 mod backups;
+mod bound_room_key_recipients;
 mod cross_signing;
 mod dehydrated_devices;
 mod own_user_only_room_keys;

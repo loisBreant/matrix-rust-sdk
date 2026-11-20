@@ -32,7 +32,7 @@ use matrix_sdk_crypto::x509::{RawX509Signer, RawX509Verifier};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
-    OlmMachineBuilder, TrustRequirement, store::DynCryptoStore,
+    OlmMachineBuilder, RoomKeyRecipientBinding, TrustRequirement, store::DynCryptoStore,
     store::types::RoomPendingKeyBundleDetails, types::requests::ToDeviceRequest,
 };
 #[cfg(doc)]
@@ -140,6 +140,11 @@ pub struct BaseClient {
     #[cfg(feature = "e2e-encryption")]
     own_user_only_room_keys: Arc<SyncRwLock<BTreeSet<OwnedRoomId>>>,
 
+    /// The users and devices each room's key is bound to (Filow patch 7, see
+    /// [`BaseClient::bind_room_key_recipients`]).
+    #[cfg(feature = "e2e-encryption")]
+    room_key_recipient_bindings: Arc<SyncRwLock<BTreeMap<OwnedRoomId, RoomKeyRecipientBinding>>>,
+
     /// The settings to use for decrypting events.
     #[cfg(feature = "e2e-encryption")]
     pub decryption_settings: DecryptionSettings,
@@ -230,6 +235,8 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             own_user_only_room_keys: Default::default(),
             #[cfg(feature = "e2e-encryption")]
+            room_key_recipient_bindings: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
             decryption_settings: DecryptionSettings {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
             },
@@ -271,6 +278,7 @@ impl BaseClient {
             global_profile_updates_sender: broadcast::Sender::new(16),
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
             own_user_only_room_keys: self.own_user_only_room_keys.clone(),
+            room_key_recipient_bindings: self.room_key_recipient_bindings.clone(),
             decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
             threading_support: self.threading_support,
@@ -1084,7 +1092,23 @@ impl BaseClient {
                     return Err(Error::EncryptionNotEnabled);
                 };
 
-                Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
+                // Filow patch 7: read again here, inside the share, so the
+                // binding the share honours is the one in place now.
+                Ok(match self.room_key_recipient_binding(room_id) {
+                    Some(binding) => {
+                        o.share_room_key_bound(
+                            room_id,
+                            members.iter().map(Deref::deref),
+                            settings,
+                            &binding,
+                        )
+                        .await?
+                    }
+                    None => {
+                        o.share_room_key(room_id, members.iter().map(Deref::deref), settings)
+                            .await?
+                    }
+                })
             }
             None => panic!("Olm machine wasn't started"),
         }
@@ -1113,20 +1137,50 @@ impl BaseClient {
     /// The users whose devices a room key of `room_id` is shared with, or who
     /// are queried and claimed for before it is: the members of `room_id`
     /// with `memberships`, or only the own user once
-    /// [`BaseClient::share_room_keys_only_with_own_user`] was called for it.
+    /// [`BaseClient::share_room_keys_only_with_own_user`] was called for it;
+    /// in either case only those the room's binding permits, once
+    /// [`BaseClient::bind_room_key_recipients`] was called for it.
     #[cfg(feature = "e2e-encryption")]
     pub async fn room_key_recipient_users(
         &self,
         room_id: &RoomId,
         memberships: RoomMemberships,
     ) -> Result<Vec<OwnedUserId>> {
-        if self.room_keys_shared_only_with_own_user(room_id) {
+        let mut users = if self.room_keys_shared_only_with_own_user(room_id) {
             let Some(session_meta) = self.session_meta() else {
                 return Err(Error::InsufficientData);
             };
-            return Ok(vec![session_meta.user_id.clone()]);
+            vec![session_meta.user_id.clone()]
+        } else {
+            self.state_store.get_user_ids(room_id, memberships).await?
+        };
+        if let Some(binding) = self.room_key_recipient_binding(room_id) {
+            users.retain(|user| binding.permits_user(user));
         }
-        Ok(self.state_store.get_user_ids(room_id, memberships).await?)
+        Ok(users)
+    }
+
+    /// From now on, share the room key of `room_id` only with the users and
+    /// devices `binding` permits, whatever the room's member list says when
+    /// the key is shared (Filow patch 7, `FILOW.md`), until the next call
+    /// for the room replaces it.
+    ///
+    /// A client that checks a room's members before it sends passes the
+    /// members it checked, so a member the room gains in between gets no
+    /// key. The share strategy still picks among what `binding` permits, and
+    /// a session a user or device it leaves out holds is rotated at the next
+    /// share, as for a member who left. There is no way back to an unbound
+    /// room for as long as this client lives.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn bind_room_key_recipients(&self, room_id: &RoomId, binding: RoomKeyRecipientBinding) {
+        self.room_key_recipient_bindings.write().insert(room_id.to_owned(), binding);
+    }
+
+    /// The binding [`BaseClient::bind_room_key_recipients`] last set for
+    /// `room_id`, if any.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn room_key_recipient_binding(&self, room_id: &RoomId) -> Option<RoomKeyRecipientBinding> {
+        self.room_key_recipient_bindings.read().get(room_id).cloned()
     }
 
     /// Get the room with the given room id.
@@ -1638,6 +1692,76 @@ mod tests {
             .await
             .unwrap();
         assert!(copy.room_keys_shared_only_with_own_user(room_id));
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_room_key_recipients_bound_to_a_checked_member_list() {
+        use matrix_sdk_crypto::RoomKeyRecipientBinding;
+        use matrix_sdk_test::JoinedRoomBuilder;
+
+        let user_id = user_id!("@alice:example.org");
+        let room_id = room_id!("!portal:example.org");
+        let other_room_id = room_id!("!chat:example.org");
+        let marked_room_id = room_id!("!ai:example.org");
+
+        let client = logged_in_base_client(Some(user_id)).await;
+        let f = EventFactory::new();
+        let bob = *BOB;
+        let joined = |user: &ruma::UserId| f.member(user).membership(MembershipState::Join);
+        let room = |id| {
+            JoinedRoomBuilder::new(id).add_state_event(joined(user_id)).add_state_event(joined(bob))
+        };
+        let response = SyncResponseBuilder::new()
+            .add_joined_room(room(room_id))
+            .add_joined_room(room(other_room_id))
+            .add_joined_room(room(marked_room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        let recipients =
+            |room_id| client.room_key_recipient_users(room_id, crate::RoomMemberships::JOIN);
+        assert_eq!(recipients(room_id).await.unwrap().len(), 2);
+        assert!(client.room_key_recipient_binding(room_id).is_none());
+
+        // Bound to the own user: Bob, a member, is no recipient, and only in
+        // the room that was bound.
+        let mut own_only = RoomKeyRecipientBinding::new();
+        own_only.allow_user(user_id.to_owned());
+        client.bind_room_key_recipients(room_id, own_only.clone());
+        assert_eq!(client.room_key_recipient_binding(room_id), Some(own_only.clone()));
+        assert_eq!(recipients(room_id).await.unwrap(), vec![user_id.to_owned()]);
+        assert_eq!(recipients(other_room_id).await.unwrap().len(), 2);
+
+        // A binding naming a user who is not a member adds no recipient.
+        let mut with_carol = own_only.clone();
+        with_carol.allow_user(ruma::owned_user_id!("@carol:example.org"));
+        client.bind_room_key_recipients(room_id, with_carol);
+        assert_eq!(recipients(room_id).await.unwrap(), vec![user_id.to_owned()]);
+
+        // A later binding replaces the earlier one.
+        let mut both = own_only.clone();
+        both.allow_user(bob.to_owned());
+        client.bind_room_key_recipients(room_id, both);
+        assert_eq!(recipients(room_id).await.unwrap().len(), 2);
+
+        // Composed with patch 3's mark: the own user only, and only if the
+        // binding permits them.
+        client.share_room_keys_only_with_own_user(marked_room_id);
+        let mut bob_only = RoomKeyRecipientBinding::new();
+        bob_only.allow_user(bob.to_owned());
+        client.bind_room_key_recipients(marked_room_id, bob_only);
+        assert!(recipients(marked_room_id).await.unwrap().is_empty());
+
+        // Shared with the client's copies.
+        let copy = client
+            .clone_with_in_memory_state_store(CrossProcessLockConfig::SingleProcess, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            copy.room_key_recipient_binding(room_id),
+            client.room_key_recipient_binding(room_id)
+        );
     }
 
     #[async_test]

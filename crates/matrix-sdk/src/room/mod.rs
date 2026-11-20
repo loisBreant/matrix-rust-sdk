@@ -2461,6 +2461,33 @@ impl Room {
         Ok(())
     }
 
+    /// From now on, share this room's key only with the users and devices
+    /// `binding` permits, whatever the room's member list says when the key
+    /// is shared, and query and claim keys for no other user before it is,
+    /// until the next call replaces the binding (Filow patch 7, `FILOW.md`).
+    ///
+    /// A client that checks a room's members before it sends passes the
+    /// members it checked, so a member the room gains in between gets no
+    /// key, nor a device a user gains when `binding` names that user's
+    /// devices. The client's room-key recipient strategy still picks among
+    /// what `binding` permits. A session a user or device it leaves out
+    /// holds is rotated at the next share, and an event is sent only under a
+    /// session no one outside the binding in place holds: one a share
+    /// running concurrently gave to someone else is rotated before the event
+    /// leaves. There is no way back to an unbound room for as long as the
+    /// client lives.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn bind_room_key_recipients(&self, binding: crate::encryption::RoomKeyRecipientBinding) {
+        self.client.base_client().bind_room_key_recipients(self.room_id(), binding);
+    }
+
+    /// The binding [`Room::bind_room_key_recipients`] last set for this
+    /// room, if any (Filow patch 7).
+    #[cfg(feature = "e2e-encryption")]
+    pub fn room_key_recipient_binding(&self) -> Option<crate::encryption::RoomKeyRecipientBinding> {
+        self.client.base_client().room_key_recipient_binding(self.room_id())
+    }
+
     /// Share a group session for a room.
     ///
     /// # Panics
