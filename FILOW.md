@@ -451,9 +451,9 @@ nothing. In Filow, `client_core/src/matrix/send.rs`'s
 `a_retired_launcher_bot_landed_mid_send_gets_no_room_key` and
 `an_own_device_published_mid_send_gets_no_room_key` land the member or the
 device inside the send's check and are red without the binding. Filow
-also holds one checked send at a time per room, so the binding in place
-during a share is that send's own, and fetches the full member list before
-its check judges it.
+also holds one checked send at a time per room in its process, so the
+binding in place during a share is that send's own, and fetches the full
+member list before its check judges it.
 
 ## Dependency bump: rusqlite 0.42.0
 
