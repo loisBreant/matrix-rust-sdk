@@ -2832,8 +2832,9 @@ impl OlmMachine {
             .record("event_id", debug(&event.event_id))
             .record("session_id", content.session_id());
 
-        let session = self.get_inbound_group_session_or_error(room_id, content.session_id()).await?;
-        self.get_encryption_info(&session, &event.sender, Some(content.message_index())).await
+        // No index: the ciphertext's header is not authenticated until it is
+        // decrypted, and this does not decrypt it (Filow patch 8).
+        self.get_session_encryption_info(room_id, content.session_id(), &event.sender).await
     }
 
     /// Get encryption info for an event decrypted with a megolm session.

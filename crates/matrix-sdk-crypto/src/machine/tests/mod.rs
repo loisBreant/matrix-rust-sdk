@@ -2312,13 +2312,11 @@ async fn test_decrypted_event_reports_its_megolm_message_index() {
     let replay = event_with("$replayed", &ciphertexts[0]);
     assert_eq!(decrypted_index(&replay).await, Some(0));
 
-    // Info recalculated from the event keeps its ciphertext's index; info
-    // recalculated from the session alone cannot know one.
+    // Info recalculated without decrypting reports no index: the header's
+    // index is authenticated only by decryption, and a forged one could
+    // otherwise claim any index.
     let recalculated = bob.get_room_event_encryption_info(&replay, room_id).await.unwrap();
-    assert_eq!(recalculated.megolm_message_index(), Some(0));
-    let second = event_with("$second", &ciphertexts[1]);
-    let recalculated = bob.get_room_event_encryption_info(&second, room_id).await.unwrap();
-    assert_eq!(recalculated.megolm_message_index(), Some(1));
+    assert_eq!(recalculated.megolm_message_index(), None);
     let from_session = bob
         .get_session_encryption_info(room_id, group_session.session_id(), alice.user_id())
         .await

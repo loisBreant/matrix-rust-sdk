@@ -470,10 +470,11 @@ new field:
   `set_megolm_message_index()`.
 - `OlmMachine::decrypt_room_event` fills it with the index vodozemac
   decrypted the ciphertext at (`InboundGroupSession::decrypt` already
-  returned it; upstream dropped it). `get_room_event_encryption_info` fills
-  it from the event's ciphertext. `get_session_encryption_info`, which has
-  no event, and the info of an event this client encrypted itself leave it
-  `None`.
+  returned it; upstream dropped it). Nothing else fills it: the
+  recalculating `get_room_event_encryption_info` and
+  `get_session_encryption_info` do not decrypt, and a ciphertext's header
+  index is authenticated only by decryption; the info of an event this
+  client encrypted itself has none either.
 - The event cache's redecryptor, which replaces an event's info with one
   recalculated from the session alone after a device or identity change,
   keeps the index the event was decrypted at.
@@ -495,7 +496,7 @@ store (Filow #223, `client_core/src/storage/megolm_indices.rs`).
 Tests: `test_decrypted_event_reports_its_megolm_message_index` in
 `crates/matrix-sdk-crypto/src/machine/tests/mod.rs` (three messages at
 indices 0 to 2, a replay of the first under another event ID reported at
-0, the info recalculated from an event and from the session alone);
+0, and no index in info recalculated without decrypting);
 `test_redecryptor_updating_encryption_info` in
 `crates/matrix-sdk/src/event_cache/redecryptor.rs` checks the index
 survives the info's update; `test_algorithm_info_message_index_serde` in

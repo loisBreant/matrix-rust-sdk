@@ -311,9 +311,10 @@ pub enum AlgorithmInfo {
 
         /// The Megolm ratchet index of the ciphertext this event was
         /// decrypted from, or None if this info was stored before we
-        /// collected this data, or was not computed from an event's
-        /// ciphertext (the info of an event this client encrypted itself, or
-        /// one recalculated from the session alone).
+        /// collected this data, or was not computed by decrypting (the info
+        /// of an event this client encrypted itself, or one recalculated
+        /// without decrypting). Only a value from decryption is
+        /// authenticated: a ciphertext's header can claim any index.
         ///
         /// A Megolm session produces each index once. Two events with
         /// different IDs decrypted at the same `(session_id, message_index)`
